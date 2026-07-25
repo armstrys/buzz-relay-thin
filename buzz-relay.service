@@ -14,6 +14,10 @@ Group=__RUN_USER__
 # WorkingDirectory is the repo checkout so relative paths and .env resolve.
 WorkingDirectory=__INSTALL_DIR__/src
 EnvironmentFile=__INSTALL_DIR__/src/.env
+# Reuse the upstream migrate+seed target on every start, so editing RELAY_URL
+# in .env re-seeds the community host without a manual step. Remove this line if
+# you would rather migrations only ever run by hand.
+ExecStartPre=/usr/bin/env bash -lc 'cd __INSTALL_DIR__/src && [ -f ./bin/activate-hermit ] && . ./bin/activate-hermit; just migrate'
 ExecStart=__INSTALL_DIR__/src/target/release/buzz-relay
 
 Restart=on-failure
@@ -29,7 +33,7 @@ SyslogIdentifier=buzz-relay
 # ---- hardening -------------------------------------------------------------
 NoNewPrivileges=true
 PrivateTmp=true
-ProtectSystem=strict
+ProtectSystem=full
 ProtectHome=true
 ReadWritePaths=__INSTALL_DIR__
 ProtectKernelTunables=true

@@ -5,3 +5,4 @@
 src/
 docker-compose.relay.yml
 *.bak
+.DS_Store

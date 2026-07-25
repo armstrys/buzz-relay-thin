@@ -1,122 +1,83 @@
-# buzz-relay server deploy
+# buzz-relay server deploy (thin / upstream-reusing variant)
 
-Relay only. No desktop, no agents, no harness. Drop this folder on a fresh
-Linux server and run `install.sh`.
+Same outcome as the self-contained package, but leans on the repo's own scripts
+instead of reimplementing them. Three files instead of five, and about a quarter
+of the hand-written config.
 
-## Files
+## What is reused from upstream
 
-| File | Purpose |
+| Concern | Upstream artifact |
 |---|---|
-| `install.sh` | Bootstrap: clone, build, render env, start datastores, migrate, seed, install unit |
-| `docker-compose.yml` | Minimal stack: Postgres, Redis, MinIO. Datastore ports bound to loopback |
-| `env.template` | Every variable the relay reads. Rendered to `src/.env` with generated secrets |
-| `buzz-relay.service` | systemd unit with hardening directives |
+| Datastore stack | the repo's `docker-compose.yml` (images, healthchecks, volumes, bucket init) |
+| Migrations + community seed | `just migrate` = `_ensure-migrations` = `buzz-admin migrate` + `scripts/seed-local-community.sh` |
+| Env baseline | `.env.example`, copied then patched, so new upstream variables are inherited |
+| Toolchain | `bin/activate-hermit` |
+| Day-two ops | `just ps`, `just logs`, `just down` |
+
+## What is still ours, and why it cannot be avoided
+
+**`docker-compose.override.yml`** exists for two reasons. The repo publishes
+ports bare (`"5432:5432"`), which binds `0.0.0.0` and would expose Postgres,
+Redis, and MinIO to the whole network on a server, with `buzz_dev` credentials.
+And the repo hardcodes those credentials, so rotation needs an override rather
+than edits to a tracked file. Compose merges the override automatically, so
+`git pull` leaves it alone.
+
+**`buzz-relay.service`** has no upstream equivalent. The repo's runner is
+`just relay` (debug build via `cargo run`) or `just relay-release`. Both are
+foreground dev commands, and running `cargo run` under systemd makes cargo the
+main PID rather than the relay, which muddies restart and signal handling. The
+unit runs `target/release/buzz-relay` directly and uses `ExecStartPre` to call
+`just migrate`, so migrate-and-seed stays upstream logic while process
+supervision stays clean.
+
+**`install.sh`** is orchestration only. About 90 lines, mostly argument parsing
+and the `.env` patch.
+
+## What is deliberately skipped from upstream
+
+`just setup` calls `scripts/dev-setup.sh`, which runs `pnpm install` for desktop
+dependencies and brings up all six compose services including Keycloak
+(`admin`/`admin`), Adminer, and Prometheus. `just build` runs
+`cargo build --workspace`, compiling the desktop and agent crates a relay box
+does not need. This installer starts four named services and builds two crates.
 
 ## Install
 
 ```
-scp -r buzz-relay-deploy/ user@server:~/
-ssh user@server
-cd buzz-relay-deploy
-sudo ./install.sh --host relay.lan --port 3000
+scp -r buzz-relay-thin/ user@server:~/
+ssh user@server 'cd buzz-relay-thin && sudo ./install.sh --host relay.lan'
 ```
 
-Use a stable DNS name for `--host` if you can. See the warning below about why.
+## Prerequisite worth checking first
 
-Verify:
-
-```
-journalctl -u buzz-relay -n 200 | grep -E 'Config loaded|Deployment community ensured'
-```
-
-`relay_url` and `host` must both show your chosen authority. If `relay_url` says
-`ws://localhost:3000`, the env did not take effect.
-
-## The one thing that will bite you: host binding
-
-The relay resolves a community from the request's **Host header** and fails
-closed when there is no matching row in the `communities` table. That table
-holds **one row per host**, so each authority is a *separate community* with its
-own channels and members.
-
-Consequences:
-
-- `localhost:3000` and `192.168.1.50:3000` are two different communities.
-- Pointing your desktop at one and your phone at the other puts them in
-  different places, and neither sees the other's messages.
-- Changing the host later does not move your community. It creates a new empty
-  one at the new address.
-- A DHCP lease change on an IP-based host orphans your community.
-
-So: pick one authority, use it on every client, and prefer a name you control.
-
-To add an authority (for example when moving to `wss://`):
+The override uses the `!override` tag, which needs Docker Compose v2.24+.
+It is load-bearing: Compose's default merge for a `ports` list is to *append*,
+so without it you would keep the `0.0.0.0` binding next to the loopback one.
 
 ```
-cd /opt/buzz-relay/src
-RELAY_URL=wss://relay.example.com ./scripts/seed-local-community.sh
+docker compose version
+cd /opt/buzz-relay/src && docker compose config | grep -A3 ports
 ```
 
-That creates the row. It does not migrate anything into it.
+Every published port should show a `127.0.0.1:` prefix. If any is bare, the
+override did not apply and your datastores are network-exposed.
 
-## What is deliberately not automated
+## Tradeoff against the self-contained package
 
-**TLS.** Traffic is plain `ws://`. Acceptable on a trusted LAN, not otherwise.
-For real exposure, put Caddy or nginx in front, serve `wss://`, then set
-`RELAY_URL` to the `wss://` authority and seed that host.
+Reuse wins on drift: an upstream fix to a healthcheck, a new service the relay
+starts depending on, or a new required variable in `.env.example` all arrive with
+`git pull`. The self-contained version would silently go stale.
 
-**Firewall.** Open the relay port yourself. Datastore ports publish to
-`127.0.0.1` only and should stay that way; the relay reaches them over loopback.
+Reuse costs you explicitness. Reading these three files does not tell you what
+the stack is; you have to read the repo's compose too. And you inherit upstream's
+choices, including the dev-oriented defaults the override has to fight.
 
-**Backups.** Postgres holds every event. `postgres-data` and `minio-data` are
-named Docker volumes. Snapshot them or run `pg_dump` on a schedule.
+Pick reuse if you intend to track upstream. Pick self-contained if you want a
+frozen, auditable deployment that does not change under you.
 
-## Secrets
+## Same caveat as before
 
-`install.sh` generates the Postgres password, the MinIO secret, and the relay's
-nostr private key with `openssl rand`, then writes `src/.env` at mode 0600. It
-will not regenerate them on a re-run.
-
-Two variables matter more than they look:
-
-- `BUZZ_RELAY_PRIVATE_KEY` — without it the relay falls back to a **hardcoded
-  dev keypair** and says so at startup.
-- `BUZZ_S3_ACCESS_KEY` / `BUZZ_S3_SECRET_KEY` — these default to
-  `buzz_dev` / `buzz_dev_secret` **in code**, so omitting them silently keeps
-  dev credentials rather than failing.
-
-The Postgres password appears twice in `.env`, once as `POSTGRES_PASSWORD` for
-compose and once inline in `DATABASE_URL` for the relay. systemd does not expand
-`${VAR}` in an `EnvironmentFile`, so it cannot be factored out. `install.sh`
-renders both from one generated value. **If you rotate by hand, change both.**
-
-## Attaching agents later
-
-The relay does not know agents exist; they are ordinary clients. To run one
-headless, on this box or another:
-
-```
-BUZZ_RELAY_URL=ws://relay.lan:3000 \
-BUZZ_PRIVATE_KEY=<agent nostr secret> \
-BUZZ_ACP_AGENT_OWNER=<your pubkey> \
-BUZZ_ACP_AGENT_COMMAND=buzz-agent \
-buzz-acp --agents 1 --respond-to owner-only
-```
-
-Note `BUZZ_RELAY_URL` is the *agent's* variable; the relay itself reads plain
-`RELAY_URL`. Build the agent binaries with
-`cargo build --release -p buzz-acp -p buzz-agent`.
-
-Skill discovery in `buzz-agent` is working-directory relative (`.agents/skills`,
-`.goose/skills`, `.claude/skills`, walking from git root down to cwd, plus
-`$HOME`), so one process per agent with its own working directory gives each
-agent its own skill set.
-
-## Known upstream bug
-
-As of late July 2026, agents can log `discovered 0 channel(s)` and sit idle even
-when the client shows them as channel members
-([block/buzz#2641](https://github.com/block/buzz/issues/2641)). It affects both
-the `buzz-agent` and Claude Code harnesses and is not caused by relay config.
-`--channels` (`BUZZ_ACP_CHANNELS`) takes an explicit channel list and may work
-around it, untested. The relay itself is unaffected.
+Each authority is its own community. The relay resolves a community from the
+Host header and fails closed when there is no matching row, one row per host.
+Pick one hostname and use it on every client, including the desktop.

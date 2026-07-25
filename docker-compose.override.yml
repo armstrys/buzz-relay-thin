@@ -1,0 +1,61 @@
+# docker-compose.override.yml
+#
+# Compose merges this over the repo's docker-compose.yml automatically, so the
+# tracked file stays untouched and `git pull` cannot clobber these changes.
+# Drop this at the repo root.
+#
+# It patches exactly two things the repo's dev compose does that are wrong on a
+# server, and nothing else. Everything not mentioned here (images, healthchecks,
+# volumes, the minio-init bucket step) is inherited from upstream, so upstream
+# fixes flow through.
+#
+#   1. Port bindings. The repo publishes bare ("5432:5432"), which binds
+#      0.0.0.0 and exposes Postgres, Redis, and MinIO to the whole network.
+#      The relay runs natively on the host, so loopback is all it needs.
+#   2. Credentials. The repo hardcodes buzz_dev / buzz_dev_secret. These read
+#      from .env instead.
+#
+# The extra dev services (adminer, keycloak, prometheus) are NOT disabled here.
+# Instead, start only what you need by naming services:
+#   docker compose up -d postgres redis minio minio-init
+#
+# REQUIRES Docker Compose v2.24+ for the `!override` tag. This is load-bearing:
+# Compose's default merge for a `ports` list is to APPEND, so without !override
+# you get BOTH "5432:5432" and "127.0.0.1:5432:5432", leaving the 0.0.0.0
+# binding in place and defeating the purpose. Verify the merged result with:
+#   docker compose config | grep -A3 ports
+# On older Compose, upgrade it, or edit the tracked docker-compose.yml directly
+# and accept that `git pull` may conflict.
+
+services:
+  postgres:
+    ports: !override
+      - "127.0.0.1:5432:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
+      POSTGRES_DB: ${POSTGRES_DB:?set in .env}
+
+  redis:
+    ports: !override
+      - "127.0.0.1:6379:6379"
+
+  minio:
+    ports: !override
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    environment:
+      MINIO_ROOT_USER: ${BUZZ_S3_ACCESS_KEY:?set in .env}
+      MINIO_ROOT_PASSWORD: ${BUZZ_S3_SECRET_KEY:?set in .env}
+
+  # The upstream minio-init entrypoint has buzz_dev credentials baked into the
+  # mc alias command, so it must be restated to match the rotated secret.
+  # This is the one place we duplicate upstream logic; if the bucket name or
+  # policy changes upstream, update it here too.
+  minio-init:
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio:9000 '${BUZZ_S3_ACCESS_KEY}' '${BUZZ_S3_SECRET_KEY}' &&
+        mc mb --ignore-existing local/${BUZZ_S3_BUCKET:-buzz-media} &&
+        mc anonymous set none local/${BUZZ_S3_BUCKET:-buzz-media}
+      "
