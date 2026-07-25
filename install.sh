@@ -212,7 +212,7 @@ BUZZ_S3_BUCKET=buzz-media
 BUZZ_S3_REGION=us-east-1
 
 BUZZ_RELAY_PRIVATE_KEY=${KEY}
-BUZZ_REQUIRE_AUTH_TOKEN=true
+BUZZ_REQUIRE_AUTH_TOKEN=false
 
 # Auxiliary relay listeners. Defaults (8080, 9102) collide easily on a shared
 # host; set with --health-port / --metrics-port, or edit and restart the service.
