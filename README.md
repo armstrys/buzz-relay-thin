@@ -1,46 +1,17 @@
-# buzz-relay server deploy (thin / upstream-reusing variant)
+# buzz-relay server deploy (thin)
 
-Same outcome as the self-contained package, but leans on the repo's own scripts
-instead of reimplementing them. Three files instead of five, and about a quarter
-of the hand-written config.
+Stand up a single-community [buzz](https://github.com/block/buzz) relay on one
+server. The relay is compiled from upstream and run **natively** under systemd;
+its datastores — Postgres, Redis, MinIO — run as Docker containers. The rest of
+the buzz monorepo (desktop app, agents, the extra dev services) is left out.
 
-## What is reused from upstream
+Three tracked files plus a generated `.env`:
 
-| Concern | Upstream artifact |
+| File | Role |
 |---|---|
-| Datastore stack | the repo's `docker-compose.yml` (images, healthchecks, volumes, bucket init) |
-| Migrations + community seed | `just migrate` = `_ensure-migrations` = `buzz-admin migrate` + `scripts/seed-local-community.sh` |
-| Env baseline | `.env.example`, copied then patched, so new upstream variables are inherited |
-| Toolchain | `bin/activate-hermit` |
-| Day-two ops | `just ps`, `just logs`, `just down` |
-
-## What is still ours, and why it cannot be avoided
-
-**`docker-compose.override.yml`** exists for two reasons. The repo publishes
-ports bare (`"5432:5432"`), which binds `0.0.0.0` and would expose Postgres,
-Redis, and MinIO to the whole network on a server, with `buzz_dev` credentials.
-And the repo hardcodes those credentials, so rotation needs an override rather
-than edits to a tracked file. Compose merges the override automatically, so
-`git pull` leaves it alone.
-
-**`buzz-relay.service`** has no upstream equivalent. The repo's runner is
-`just relay` (debug build via `cargo run`) or `just relay-release`. Both are
-foreground dev commands, and running `cargo run` under systemd makes cargo the
-main PID rather than the relay, which muddies restart and signal handling. The
-unit runs `target/release/buzz-relay` directly and uses `ExecStartPre` to call
-`just migrate`, so migrate-and-seed stays upstream logic while process
-supervision stays clean.
-
-**`install.sh`** is orchestration only. About 90 lines, mostly argument parsing
-and the `.env` patch.
-
-## What is deliberately skipped from upstream
-
-`just setup` calls `scripts/dev-setup.sh`, which runs `pnpm install` for desktop
-dependencies and brings up all six compose services including Keycloak
-(`admin`/`admin`), Adminer, and Prometheus. `just build` runs
-`cargo build --workspace`, compiling the desktop and agent crates a relay box
-does not need. This installer starts four named services and builds two crates.
+| `install.sh` | Clones upstream, renders `.env`, builds the relay, starts the datastores, migrates + seeds, installs the systemd unit. |
+| `docker-compose.override.yml` | Merged over upstream's `docker-compose.yml` to bind the datastores to loopback and read their credentials and ports from `.env`. |
+| `buzz-relay.service` | systemd unit: apply migrations, then run the release binary as the main process. |
 
 ## Install
 
@@ -49,35 +20,103 @@ scp -r buzz-relay-thin/ user@server:~/
 ssh user@server 'cd buzz-relay-thin && sudo ./install.sh --host relay.lan'
 ```
 
-## Prerequisite worth checking first
+`--host` is required and load-bearing: it becomes `RELAY_URL` and the seeded
+community host, and every client must connect with that exact authority (see
+[One host, one community](#one-host-one-community)).
 
-The override uses the `!override` tag, which needs Docker Compose v2.24+.
-It is load-bearing: Compose's default merge for a `ports` list is to *append*,
-so without it you would keep the `0.0.0.0` binding next to the loopback one.
+Re-running is safe. Generated secrets in `.env` are left untouched; only the
+host and ports are re-applied. Add `--update` to `git pull` the checkout before
+rebuilding.
+
+## Ports
+
+The relay binds three ports on the host, and the datastores publish four more on
+loopback. On a shared box any of these can collide with something already
+running, so each is overridable. `install.sh` writes the value into `.env` and
+keeps the relay's own config and the published container ports in sync.
+
+| Flag | Default | Service |
+|---|---|---|
+| `--port` | 3000 | relay (`RELAY_URL` / `BUZZ_BIND_ADDR`) — the only port meant to be reachable off-box |
+| `--health-port` | 8080 | relay health probe |
+| `--metrics-port` | 9102 | relay Prometheus exporter |
+| `--pg-port` | 5432 | Postgres |
+| `--redis-port` | 6379 | Redis |
+| `--minio-port` | 9000 | MinIO S3 API |
+| `--minio-console-port` | 9001 | MinIO console |
+
+On a crowded host, move the ones that clash:
 
 ```
-docker compose version
+sudo ./install.sh --host relay.lan --port 3001 --health-port 8180
+```
+
+Only the host-side port changes; container-internal ports stay fixed, so
+inter-container references such as MinIO's `minio:9000` keep working.
+
+## What it builds and starts
+
+- **Builds** only `buzz-relay` and `buzz-admin` in release — not the workspace,
+  so no desktop or agent crates compile.
+- **Starts** only `postgres`, `redis`, `minio`, and the one-shot `minio-init`
+  bucket step. Upstream's dev-only services (Keycloak, Adminer, Prometheus) are
+  never brought up.
+- **Migrates and seeds** at install time via upstream's `just migrate`
+  (`buzz-admin migrate` plus the community-host seed script).
+
+## One host, one community
+
+The relay resolves a community from the incoming `Host` header and **fails
+closed** when no row matches — one row per host, one community per authority.
+So a single hostname has to agree everywhere: the value you pass to `--host`,
+the `ws://…` URL entered in every client, and the desktop app. Prefer a stable
+DNS name over a DHCP address. If you later front the relay with a TLS proxy and
+serve `wss://`, re-run `install.sh` with `--host` set to the new authority to
+seed that host.
+
+## The systemd unit
+
+`Type=simple`, running `target/release/buzz-relay` directly so the relay is the
+main PID and restart/signal handling stays clean. `ExecStartPre` re-applies
+migrations on every start using the compiled `buzz-admin migrate` binary —
+deliberately **not** `just migrate`, because `just` comes from Hermit, which
+needs a writable `$HOME/.cache` that this unit's hardening
+(`ProtectHome`/`ProtectSystem`) denies. Migrations are idempotent and the relay
+ensures its own community row at startup, so a boot with nothing to do is a
+no-op.
+
+Day-two operations:
+
+```
+systemctl {status,restart,stop} buzz-relay
+journalctl -u buzz-relay -f
+```
+
+## Verify
+
+Two log lines confirm a healthy start:
+
+```
+journalctl -u buzz-relay -n 200 | grep -E 'Config loaded|Deployment community ensured'
+```
+
+`Config loaded` should show your `relay_url` and the three relay ports;
+`Deployment community ensured` should show `host=<your-host>:<port>`.
+
+Then confirm the override actually merged. It relies on the `!override` YAML tag,
+which needs **Docker Compose v2.24+**: without it, Compose *appends* port lists
+and the upstream `0.0.0.0` binding survives right next to the loopback one.
+
+```
 cd /opt/buzz-relay/src && docker compose config | grep -A3 ports
 ```
 
-Every published port should show a `127.0.0.1:` prefix. If any is bare, the
-override did not apply and your datastores are network-exposed.
+Every published datastore port must carry a `127.0.0.1:` prefix. A bare binding
+means the override did not apply and your datastores are exposed to the network.
 
-## Tradeoff against the self-contained package
+## Left to you
 
-Reuse wins on drift: an upstream fix to a healthcheck, a new service the relay
-starts depending on, or a new required variable in `.env.example` all arrive with
-`git pull`. The self-contained version would silently go stale.
-
-Reuse costs you explicitness. Reading these three files does not tell you what
-the stack is; you have to read the repo's compose too. And you inherit upstream's
-choices, including the dev-oriented defaults the override has to fight.
-
-Pick reuse if you intend to track upstream. Pick self-contained if you want a
-frozen, auditable deployment that does not change under you.
-
-## Same caveat as before
-
-Each authority is its own community. The relay resolves a community from the
-Host header and fails closed when there is no matching row, one row per host.
-Pick one hostname and use it on every client, including the desktop.
+- Open the relay port in the host firewall. The datastore ports are bound to
+  loopback — keep them there.
+- Traffic is plain `ws://`. Off a trusted LAN, terminate TLS in a reverse proxy,
+  serve `wss://`, and re-run with `--host` set to the `wss://` authority.

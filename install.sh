@@ -23,6 +23,12 @@ REPO_URL="https://github.com/block/buzz.git"
 INSTALL_DIR="/opt/buzz-relay"
 RELAY_HOST=""
 RELAY_PORT="3000"
+HEALTH_PORT="8080"
+METRICS_PORT="9102"
+PG_PORT="5432"
+REDIS_PORT="6379"
+MINIO_PORT="9000"
+MINIO_CONSOLE_PORT="9001"
 RUN_USER="${SUDO_USER:-$(id -un)}"
 DO_SYSTEMD=1
 
@@ -31,12 +37,34 @@ log()  { printf '\033[1;33m[relay]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;35m[relay] warn:\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m[relay] error:\033[0m %s\n' "$*" >&2; exit 1; }
 
+# Set KEY=VALUE in an env file: patch the line in place if present, else append
+# it. Runs file ops as $RUN_USER so ownership stays correct. Value must not
+# contain a literal '|' (sed delimiter); ports and localhost URLs never do.
+ensure_kv() {
+  local file="$1" key="$2" val="$3"
+  if sudo -u "$RUN_USER" grep -q "^${key}=" "$file"; then
+    sudo -u "$RUN_USER" sed -i -e "s|^${key}=.*|${key}=${val}|" "$file"
+  else
+    printf '%s=%s\n' "$key" "$val" | sudo -u "$RUN_USER" tee -a "$file" >/dev/null
+  fi
+}
+
 usage() {
   cat <<EOF
-Usage: sudo ./install.sh --host HOST [--port N] [--dir PATH] [--user NAME] [--no-systemd]
+Usage: sudo ./install.sh --host HOST [port options] [--dir PATH] [--user NAME] [--no-systemd]
 
 --host is required: the canonical authority every client will use. It becomes
 RELAY_URL and the seeded community host. Each authority is a separate community.
+
+Port options (every listener the stack binds on the host — override any that
+collide on a shared box; all bind loopback except the relay):
+  --port N                relay listener (RELAY_URL / BUZZ_BIND_ADDR), default 3000
+  --health-port N         relay health probe (BUZZ_HEALTH_PORT),       default 8080
+  --metrics-port N        relay Prometheus (BUZZ_METRICS_PORT),        default 9102
+  --pg-port N             Postgres host port,                          default 5432
+  --redis-port N          Redis host port,                             default 6379
+  --minio-port N          MinIO S3 API host port,                      default 9000
+  --minio-console-port N  MinIO console host port,                     default 9001
 EOF
 }
 
@@ -44,6 +72,12 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --host) RELAY_HOST="$2"; shift 2 ;;
     --port) RELAY_PORT="$2"; shift 2 ;;
+    --health-port)  HEALTH_PORT="$2"; shift 2 ;;
+    --metrics-port) METRICS_PORT="$2"; shift 2 ;;
+    --pg-port)            PG_PORT="$2"; shift 2 ;;
+    --redis-port)         REDIS_PORT="$2"; shift 2 ;;
+    --minio-port)         MINIO_PORT="$2"; shift 2 ;;
+    --minio-console-port) MINIO_CONSOLE_PORT="$2"; shift 2 ;;
     --dir)  INSTALL_DIR="$2"; shift 2 ;;
     --user) RUN_USER="$2"; shift 2 ;;
     --no-systemd) DO_SYSTEMD=0; shift ;;
@@ -78,11 +112,22 @@ chown -R "$RUN_USER":"$RUN_USER" "$INSTALL_DIR" 2>/dev/null || true
 # Copying .env.example rather than templating it means new upstream variables
 # are inherited on future re-installs instead of silently missing.
 if [[ -f "$SRC/.env" ]]; then
-  log ".env exists; patching host only, leaving secrets alone"
-  sudo -u "$RUN_USER" sed -i \
-    -e "s|^RELAY_URL=.*|RELAY_URL=ws://${RELAY_HOST}:${RELAY_PORT}|" \
-    -e "s|^BUZZ_BIND_ADDR=.*|BUZZ_BIND_ADDR=0.0.0.0:${RELAY_PORT}|" \
-    "$SRC/.env"
+  log ".env exists; patching host and ports only, leaving secrets alone"
+  # Relay-facing values (no secrets): patch in place, or add if the .env predates them.
+  ensure_kv "$SRC/.env" RELAY_URL          "ws://${RELAY_HOST}:${RELAY_PORT}"
+  ensure_kv "$SRC/.env" BUZZ_BIND_ADDR     "0.0.0.0:${RELAY_PORT}"
+  ensure_kv "$SRC/.env" BUZZ_HEALTH_PORT   "${HEALTH_PORT}"
+  ensure_kv "$SRC/.env" BUZZ_METRICS_PORT  "${METRICS_PORT}"
+  ensure_kv "$SRC/.env" PGPORT             "${PG_PORT}"
+  ensure_kv "$SRC/.env" REDIS_URL          "redis://localhost:${REDIS_PORT}"
+  ensure_kv "$SRC/.env" BUZZ_S3_ENDPOINT   "http://localhost:${MINIO_PORT}"
+  # Host-published ports consumed by docker-compose.override.yml.
+  ensure_kv "$SRC/.env" POSTGRES_PORT      "${PG_PORT}"
+  ensure_kv "$SRC/.env" REDIS_PORT         "${REDIS_PORT}"
+  ensure_kv "$SRC/.env" MINIO_PORT         "${MINIO_PORT}"
+  ensure_kv "$SRC/.env" MINIO_CONSOLE_PORT "${MINIO_CONSOLE_PORT}"
+  # DATABASE_URL carries the PG password, so swap only its port, not the whole line.
+  sudo -u "$RUN_USER" sed -i -e "s|^\(DATABASE_URL=postgres://[^@]*@localhost:\)[0-9]*|\1${PG_PORT}|" "$SRC/.env"
 else
   log "Creating .env from upstream .env.example and patching"
   PG="$(openssl rand -hex 24)"
@@ -95,8 +140,10 @@ else
   sudo -u "$RUN_USER" sed -i \
     -e "s|^RELAY_URL=.*|RELAY_URL=ws://${RELAY_HOST}:${RELAY_PORT}|" \
     -e "s|^BUZZ_BIND_ADDR=.*|BUZZ_BIND_ADDR=0.0.0.0:${RELAY_PORT}|" \
-    -e "s|^DATABASE_URL=.*|DATABASE_URL=postgres://buzz:${PG}@localhost:5432/buzz|" \
+    -e "s|^DATABASE_URL=.*|DATABASE_URL=postgres://buzz:${PG}@localhost:${PG_PORT}/buzz|" \
     -e "s|^PGPASSWORD=.*|PGPASSWORD=${PG}|" \
+    -e "s|^PGPORT=.*|PGPORT=${PG_PORT}|" \
+    -e "s|^REDIS_URL=.*|REDIS_URL=redis://localhost:${REDIS_PORT}|" \
     -e "s|^RUST_LOG=.*|RUST_LOG=buzz_relay=info,buzz_db=info,buzz_auth=info,buzz_pubsub=info,tower_http=warn|" \
     "$SRC/.env"
 
@@ -109,7 +156,7 @@ POSTGRES_USER=buzz
 POSTGRES_PASSWORD=${PG}
 POSTGRES_DB=buzz
 
-BUZZ_S3_ENDPOINT=http://localhost:9000
+BUZZ_S3_ENDPOINT=http://localhost:${MINIO_PORT}
 BUZZ_S3_ACCESS_KEY=buzzrelay
 BUZZ_S3_SECRET_KEY=${S3}
 BUZZ_S3_BUCKET=buzz-media
@@ -117,6 +164,20 @@ BUZZ_S3_REGION=us-east-1
 
 BUZZ_RELAY_PRIVATE_KEY=${KEY}
 BUZZ_REQUIRE_AUTH_TOKEN=true
+
+# Auxiliary relay listeners. Defaults (8080, 9102) collide easily on a shared
+# host; set with --health-port / --metrics-port, or edit and restart the service.
+BUZZ_HEALTH_PORT=${HEALTH_PORT}
+BUZZ_METRICS_PORT=${METRICS_PORT}
+
+# Host-published datastore ports. docker-compose.override.yml interpolates these
+# to decide what each container binds on the host; the container-internal ports
+# stay fixed, so inter-container DNS (e.g. minio:9000) is unaffected. Override
+# with --pg-port / --redis-port / --minio-port / --minio-console-port.
+POSTGRES_PORT=${PG_PORT}
+REDIS_PORT=${REDIS_PORT}
+MINIO_PORT=${MINIO_PORT}
+MINIO_CONSOLE_PORT=${MINIO_CONSOLE_PORT}
 EOF
 fi
 chmod 600 "$SRC/.env"

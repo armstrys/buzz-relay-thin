@@ -11,7 +11,12 @@
 #
 #   1. Port bindings. The repo publishes bare ("5432:5432"), which binds
 #      0.0.0.0 and exposes Postgres, Redis, and MinIO to the whole network.
-#      The relay runs natively on the host, so loopback is all it needs.
+#      The relay runs natively on the host, so loopback is all it needs. The
+#      host-side port is taken from .env (POSTGRES_PORT / REDIS_PORT / MINIO_PORT
+#      / MINIO_CONSOLE_PORT, set by install.sh --pg-port etc.) with the upstream
+#      default as a fallback, so a crowded host can move any of them. The
+#      container-internal port stays fixed, so minio-init's http://minio:9000
+#      and the like are unaffected.
 #   2. Credentials. The repo hardcodes buzz_dev / buzz_dev_secret. These read
 #      from .env instead.
 #
@@ -30,7 +35,7 @@
 services:
   postgres:
     ports: !override
-      - "127.0.0.1:5432:5432"
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
     environment:
       POSTGRES_USER: ${POSTGRES_USER:?set in .env}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
@@ -38,12 +43,12 @@ services:
 
   redis:
     ports: !override
-      - "127.0.0.1:6379:6379"
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
 
   minio:
     ports: !override
-      - "127.0.0.1:9000:9000"
-      - "127.0.0.1:9001:9001"
+      - "127.0.0.1:${MINIO_PORT:-9000}:9000"
+      - "127.0.0.1:${MINIO_CONSOLE_PORT:-9001}:9001"
     environment:
       MINIO_ROOT_USER: ${BUZZ_S3_ACCESS_KEY:?set in .env}
       MINIO_ROOT_PASSWORD: ${BUZZ_S3_SECRET_KEY:?set in .env}
