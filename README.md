@@ -54,6 +54,19 @@ sudo ./install.sh --host relay.lan --port 3001 --health-port 8180
 Only the host-side port changes; container-internal ports stay fixed, so
 inter-container references such as MinIO's `minio:9000` keep working.
 
+**The flags are for a fresh install; after that, `.env` on the box is the source
+of truth.** A re-run keeps whatever ports are already in `.env` and only changes
+one if you pass its flag again — so to move a port later you can either pass the
+flag, or just edit `/opt/buzz-relay/src/.env` and restart the service:
+
+```
+sudo systemctl restart buzz-relay                    # relay ports
+cd /opt/buzz-relay/src && docker compose up -d       # datastore ports
+```
+
+Your edits survive the next `sudo ./install.sh --update`; they are not reset to
+the defaults.
+
 ## What it builds and starts
 
 - **Builds** only `buzz-relay` and `buzz-admin` in release — not the workspace,

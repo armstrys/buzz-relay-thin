@@ -22,15 +22,27 @@ set -euo pipefail
 REPO_URL="https://github.com/block/buzz.git"
 INSTALL_DIR="/opt/buzz-relay"
 RELAY_HOST=""
-RELAY_PORT="3000"
-HEALTH_PORT="8080"
-METRICS_PORT="9102"
-PG_PORT="5432"
-REDIS_PORT="6379"
-MINIO_PORT="9000"
-MINIO_CONSOLE_PORT="9001"
 RUN_USER="${SUDO_USER:-$(id -un)}"
 DO_SYSTEMD=1
+
+# Port defaults for a FRESH install. On a re-run the value already in .env wins,
+# so ports edited by hand on the box survive; a port only changes on re-run if
+# its flag is passed explicitly. The flag vars start empty ("not passed") and
+# are resolved to these defaults only when first creating .env.
+DEFAULT_RELAY_PORT=3000
+DEFAULT_HEALTH_PORT=8080
+DEFAULT_METRICS_PORT=9102
+DEFAULT_PG_PORT=5432
+DEFAULT_REDIS_PORT=6379
+DEFAULT_MINIO_PORT=9000
+DEFAULT_MINIO_CONSOLE_PORT=9001
+RELAY_PORT=""
+HEALTH_PORT=""
+METRICS_PORT=""
+PG_PORT=""
+REDIS_PORT=""
+MINIO_PORT=""
+MINIO_CONSOLE_PORT=""
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 log()  { printf '\033[1;33m[relay]\033[0m %s\n' "$*"; }
@@ -57,7 +69,9 @@ Usage: sudo ./install.sh --host HOST [port options] [--dir PATH] [--user NAME] [
 RELAY_URL and the seeded community host. Each authority is a separate community.
 
 Port options (every listener the stack binds on the host — override any that
-collide on a shared box; all bind loopback except the relay):
+collide on a shared box; all bind loopback except the relay). Defaults apply to
+a fresh install; on a re-run the value already in .env is kept unless you pass
+the flag again, so ports you edit directly in .env on the box persist:
   --port N                relay listener (RELAY_URL / BUZZ_BIND_ADDR), default 3000
   --health-port N         relay health probe (BUZZ_HEALTH_PORT),       default 8080
   --metrics-port N        relay Prometheus (BUZZ_METRICS_PORT),        default 9102
@@ -112,24 +126,44 @@ chown -R "$RUN_USER":"$RUN_USER" "$INSTALL_DIR" 2>/dev/null || true
 # Copying .env.example rather than templating it means new upstream variables
 # are inherited on future re-installs instead of silently missing.
 if [[ -f "$SRC/.env" ]]; then
-  log ".env exists; patching host and ports only, leaving secrets alone"
-  # Relay-facing values (no secrets): patch in place, or add if the .env predates them.
-  ensure_kv "$SRC/.env" RELAY_URL          "ws://${RELAY_HOST}:${RELAY_PORT}"
-  ensure_kv "$SRC/.env" BUZZ_BIND_ADDR     "0.0.0.0:${RELAY_PORT}"
-  ensure_kv "$SRC/.env" BUZZ_HEALTH_PORT   "${HEALTH_PORT}"
-  ensure_kv "$SRC/.env" BUZZ_METRICS_PORT  "${METRICS_PORT}"
-  ensure_kv "$SRC/.env" PGPORT             "${PG_PORT}"
-  ensure_kv "$SRC/.env" REDIS_URL          "redis://localhost:${REDIS_PORT}"
-  ensure_kv "$SRC/.env" BUZZ_S3_ENDPOINT   "http://localhost:${MINIO_PORT}"
-  # Host-published ports consumed by docker-compose.override.yml.
-  ensure_kv "$SRC/.env" POSTGRES_PORT      "${PG_PORT}"
-  ensure_kv "$SRC/.env" REDIS_PORT         "${REDIS_PORT}"
-  ensure_kv "$SRC/.env" MINIO_PORT         "${MINIO_PORT}"
-  ensure_kv "$SRC/.env" MINIO_CONSOLE_PORT "${MINIO_CONSOLE_PORT}"
-  # DATABASE_URL carries the PG password, so swap only its port, not the whole line.
-  sudo -u "$RUN_USER" sed -i -e "s|^\(DATABASE_URL=postgres://[^@]*@localhost:\)[0-9]*|\1${PG_PORT}|" "$SRC/.env"
+  log ".env exists; re-applying host, keeping ports unless a flag overrides"
+  # The relay port lives in both RELAY_URL and BUZZ_BIND_ADDR alongside the host.
+  # --host is re-applied every run, so preserve the existing relay port (unless
+  # --port was passed) instead of resetting it: read it back from BUZZ_BIND_ADDR.
+  cur_relay_port="$(sudo -u "$RUN_USER" sed -n 's|^BUZZ_BIND_ADDR=0\.0\.0\.0:\([0-9]\{1,\}\).*|\1|p' "$SRC/.env" | head -1)"
+  rp="${RELAY_PORT:-${cur_relay_port:-$DEFAULT_RELAY_PORT}}"
+  RELAY_PORT="$rp"   # the effective relay port, for the log/summary lines below
+  ensure_kv "$SRC/.env" RELAY_URL      "ws://${RELAY_HOST}:${rp}"
+  ensure_kv "$SRC/.env" BUZZ_BIND_ADDR "0.0.0.0:${rp}"
+  # Every other port is only touched when its flag is passed, so hand edits in
+  # .env survive a re-run.
+  [[ -n "$HEALTH_PORT"  ]] && ensure_kv "$SRC/.env" BUZZ_HEALTH_PORT  "$HEALTH_PORT"
+  [[ -n "$METRICS_PORT" ]] && ensure_kv "$SRC/.env" BUZZ_METRICS_PORT "$METRICS_PORT"
+  if [[ -n "$PG_PORT" ]]; then
+    ensure_kv "$SRC/.env" PGPORT        "$PG_PORT"
+    ensure_kv "$SRC/.env" POSTGRES_PORT "$PG_PORT"
+    # DATABASE_URL carries the PG password, so swap only its port, not the line.
+    sudo -u "$RUN_USER" sed -i -e "s|^\(DATABASE_URL=postgres://[^@]*@localhost:\)[0-9]*|\1${PG_PORT}|" "$SRC/.env"
+  fi
+  if [[ -n "$REDIS_PORT" ]]; then
+    ensure_kv "$SRC/.env" REDIS_URL  "redis://localhost:${REDIS_PORT}"
+    ensure_kv "$SRC/.env" REDIS_PORT "$REDIS_PORT"
+  fi
+  if [[ -n "$MINIO_PORT" ]]; then
+    ensure_kv "$SRC/.env" BUZZ_S3_ENDPOINT "http://localhost:${MINIO_PORT}"
+    ensure_kv "$SRC/.env" MINIO_PORT       "$MINIO_PORT"
+  fi
+  [[ -n "$MINIO_CONSOLE_PORT" ]] && ensure_kv "$SRC/.env" MINIO_CONSOLE_PORT "$MINIO_CONSOLE_PORT"
 else
   log "Creating .env from upstream .env.example and patching"
+  # Fresh install: resolve each port to its flag value or the default.
+  RELAY_PORT="${RELAY_PORT:-$DEFAULT_RELAY_PORT}"
+  HEALTH_PORT="${HEALTH_PORT:-$DEFAULT_HEALTH_PORT}"
+  METRICS_PORT="${METRICS_PORT:-$DEFAULT_METRICS_PORT}"
+  PG_PORT="${PG_PORT:-$DEFAULT_PG_PORT}"
+  REDIS_PORT="${REDIS_PORT:-$DEFAULT_REDIS_PORT}"
+  MINIO_PORT="${MINIO_PORT:-$DEFAULT_MINIO_PORT}"
+  MINIO_CONSOLE_PORT="${MINIO_CONSOLE_PORT:-$DEFAULT_MINIO_CONSOLE_PORT}"
   PG="$(openssl rand -hex 24)"
   S3="$(openssl rand -hex 24)"
   KEY="$(openssl rand -hex 32)"
