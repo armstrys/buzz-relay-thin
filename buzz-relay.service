@@ -14,10 +14,14 @@ Group=__RUN_USER__
 # WorkingDirectory is the repo checkout so relative paths and .env resolve.
 WorkingDirectory=__INSTALL_DIR__/src
 EnvironmentFile=__INSTALL_DIR__/src/.env
-# Reuse the upstream migrate+seed target on every start, so editing RELAY_URL
-# in .env re-seeds the community host without a manual step. Remove this line if
-# you would rather migrations only ever run by hand.
-ExecStartPre=/usr/bin/env bash -lc 'cd __INSTALL_DIR__/src && [ -f ./bin/activate-hermit ] && . ./bin/activate-hermit; just migrate'
+# Apply migrations on every start via the compiled buzz-admin binary. This
+# deliberately does NOT use `just migrate`: `just` comes from Hermit, which
+# needs a writable ~/.cache and a login PATH, neither of which exist under this
+# unit's hardening (ProtectHome/ProtectSystem make /root read-only). The binary
+# needs neither. Migrations are idempotent; the relay itself ensures the
+# community host row at startup ("Deployment community ensured"), so no seed
+# step is required here. Remove this line to migrate only by hand.
+ExecStartPre=__INSTALL_DIR__/src/target/release/buzz-admin migrate
 ExecStart=__INSTALL_DIR__/src/target/release/buzz-relay
 
 Restart=on-failure
