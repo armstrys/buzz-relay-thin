@@ -1,0 +1,7 @@
+# Rendered env with generated secrets (install.sh writes this into the checkout)
+.env
+*.env
+!env.template
+src/
+docker-compose.relay.yml
+*.bak

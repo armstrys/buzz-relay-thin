@@ -1,0 +1,44 @@
+[Unit]
+Description=buzz relay
+Documentation=https://github.com/block/buzz
+# The relay needs Postgres, Redis, and MinIO, which run as containers.
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=__RUN_USER__
+Group=__RUN_USER__
+
+# WorkingDirectory is the repo checkout so relative paths and .env resolve.
+WorkingDirectory=__INSTALL_DIR__/src
+EnvironmentFile=__INSTALL_DIR__/src/.env
+ExecStart=__INSTALL_DIR__/src/target/release/buzz-relay
+
+Restart=on-failure
+RestartSec=5s
+# Give the datastores time to come up after a host reboot before giving up.
+StartLimitBurst=10
+StartLimitIntervalSec=120
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=buzz-relay
+
+# ---- hardening -------------------------------------------------------------
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=__INSTALL_DIR__
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+
+[Install]
+WantedBy=multi-user.target
