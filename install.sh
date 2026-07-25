@@ -24,6 +24,7 @@ INSTALL_DIR="/opt/buzz-relay"
 RELAY_HOST=""
 RUN_USER="${SUDO_USER:-$(id -un)}"
 DO_SYSTEMD=1
+DO_UPDATE=0
 
 # Port defaults for a FRESH install. On a re-run the value already in .env wins,
 # so ports edited by hand on the box survive; a port only changes on re-run if
@@ -63,7 +64,7 @@ ensure_kv() {
 
 usage() {
   cat <<EOF
-Usage: sudo ./install.sh --host HOST [port options] [--dir PATH] [--user NAME] [--no-systemd]
+Usage: sudo ./install.sh --host HOST [port options] [--update] [--dir PATH] [--user NAME] [--no-systemd]
 
 --host is required: the canonical authority every client will use. It becomes
 RELAY_URL and the seeded community host. Each authority is a separate community.
@@ -79,6 +80,12 @@ the flag again, so ports you edit directly in .env on the box persist:
   --redis-port N          Redis host port,                             default 6379
   --minio-port N          MinIO S3 API host port,                      default 9000
   --minio-console-port N  MinIO console host port,                     default 9001
+
+Other options:
+  --update                git pull the upstream buzz checkout before rebuilding
+  --dir PATH              install root (default /opt/buzz-relay)
+  --user NAME             owner/runtime user (default: invoking user)
+  --no-systemd            skip installing the systemd unit
 EOF
 }
 
@@ -95,6 +102,7 @@ while [[ $# -gt 0 ]]; do
     --dir)  INSTALL_DIR="$2"; shift 2 ;;
     --user) RUN_USER="$2"; shift 2 ;;
     --no-systemd) DO_SYSTEMD=0; shift ;;
+    --update) DO_UPDATE=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "Unknown option: $1" ;;
   esac
@@ -114,8 +122,15 @@ SRC="$INSTALL_DIR/src"
 mkdir -p "$INSTALL_DIR"
 
 # ---- clone -----------------------------------------------------------------
+# --update pulls the upstream buzz source ($SRC), not this deploy repo. To pick
+# up changes to install.sh / the unit / the override, git pull this repo and
+# re-run. The clone is shallow, so a plain ff-only pull is enough.
 if [[ -d "$SRC/.git" ]]; then
   log "Existing checkout at $SRC"
+  if [[ "$DO_UPDATE" -eq 1 ]]; then
+    log "Updating upstream checkout (git pull --ff-only)"
+    sudo -u "$RUN_USER" git -C "$SRC" pull --ff-only
+  fi
 else
   log "Cloning"
   sudo -u "$RUN_USER" git clone --depth 1 "$REPO_URL" "$SRC"
