@@ -87,38 +87,6 @@ DNS name over a DHCP address. If you later front the relay with a TLS proxy and
 serve `wss://`, re-run `install.sh` with `--host` set to the new authority to
 seed that host.
 
-## Inviting users
-
-The easy way to onboard someone is an **invite code** — they never need to know
-their own pubkey. On the server:
-
-```
-./mint-invite.sh              # prints an invite URL (default 72h)
-./mint-invite.sh --ttl-hours 168
-```
-
-Hand the printed `http://<host>:<port>/invite/<code>` URL to the new user. They
-create their identity in the desktop app, paste the URL into **Join a
-community**, and their pubkey is registered on claim. A fresh install prints one
-invite automatically at the end.
-
-How it works: a buzz invite is a stateless, HMAC-signed token
-(`base64url(payload).base64url(hmac)`), keyed off the relay's private key — no
-server-side invite storage. So `mint-invite.sh` builds one from `.env` plus the
-community UUID, and the relay verifies the same HMAC on claim. Codes are
-multi-use until they expire; **rotating `BUZZ_RELAY_PRIVATE_KEY` revokes every
-outstanding invite** at once.
-
-Alternatives:
-- **Make someone an admin** (not just a member): `--admin <npub>` at install, or
-  `buzz-admin add-member <npub> --role admin` any time. Requires their pubkey.
-- **Open relay**: the install sets `BUZZ_REQUIRE_AUTH_TOKEN=false`, and
-  `BUZZ_REQUIRE_RELAY_MEMBERSHIP` is off by default, so on a trusted LAN anyone
-  who can reach the port can use it. Do not expose the port publicly like this.
-
-> The relay's own `BUZZ_RELAY_PRIVATE_KEY` (in `.env`, plaintext, `0600`) is the
-> relay's identity — never paste it into a client as a personal login.
-
 ## The systemd unit
 
 `Type=simple`, running `target/release/buzz-relay` directly so the relay is the

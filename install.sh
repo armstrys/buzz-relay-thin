@@ -22,7 +22,6 @@ set -euo pipefail
 REPO_URL="https://github.com/block/buzz.git"
 INSTALL_DIR="/opt/buzz-relay"
 RELAY_HOST=""
-ADMIN_PUBKEY=""
 RUN_USER="${SUDO_USER:-$(id -un)}"
 DO_SYSTEMD=1
 DO_UPDATE=0
@@ -70,12 +69,6 @@ Usage: sudo ./install.sh --host HOST [port options] [--update] [--dir PATH] [--u
 --host is required: the canonical authority every client will use. It becomes
 RELAY_URL and the seeded community host. Each authority is a separate community.
 
---admin NPUB   register your OWN Nostr pubkey (bech32 npub or 64-char hex) as an
-               admin member, so you connect as yourself. Without this, the only
-               privileged identity is the relay's own key in .env — do NOT paste
-               that into a client. Add yourself later with:
-                 buzz-admin add-member <npub> --role admin
-
 Port options (every listener the stack binds on the host — override any that
 collide on a shared box; all bind loopback except the relay). Defaults apply to
 a fresh install; on a re-run the value already in .env is kept unless you pass
@@ -98,9 +91,8 @@ EOF
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --host)  RELAY_HOST="$2"; shift 2 ;;
-    --admin) ADMIN_PUBKEY="$2"; shift 2 ;;
-    --port)  RELAY_PORT="$2"; shift 2 ;;
+    --host) RELAY_HOST="$2"; shift 2 ;;
+    --port) RELAY_PORT="$2"; shift 2 ;;
     --health-port)  HEALTH_PORT="$2"; shift 2 ;;
     --metrics-port) METRICS_PORT="$2"; shift 2 ;;
     --pg-port)            PG_PORT="$2"; shift 2 ;;
@@ -220,7 +212,7 @@ BUZZ_S3_BUCKET=buzz-media
 BUZZ_S3_REGION=us-east-1
 
 BUZZ_RELAY_PRIVATE_KEY=${KEY}
-BUZZ_REQUIRE_AUTH_TOKEN=false
+BUZZ_REQUIRE_AUTH_TOKEN=true
 
 # Auxiliary relay listeners. Defaults (8080, 9102) collide easily on a shared
 # host; set with --health-port / --metrics-port, or edit and restart the service.
@@ -275,19 +267,6 @@ sudo -u "$RUN_USER" bash -lc "
   just migrate
 " || die "'just migrate' failed."
 
-# ---- optional: register an admin so nobody has to borrow the relay key -----
-# buzz-admin writes the membership row straight to the DB (no REST-auth needed)
-# and accepts a bech32 npub or 64-char hex. This is how you make YOUR OWN key an
-# admin, instead of pasting the relay's private key into a client.
-if [[ -n "$ADMIN_PUBKEY" ]]; then
-  log "Registering admin member: $ADMIN_PUBKEY"
-  sudo -u "$RUN_USER" bash -lc "
-    cd '$SRC' && set -o allexport && . ./.env && set +o allexport &&
-    ./target/release/buzz-admin add-member '$ADMIN_PUBKEY' --role admin
-  " || warn "add-member failed. Retry after the relay is up:
-    cd $SRC && set -o allexport && . ./.env && set +o allexport && ./target/release/buzz-admin add-member '$ADMIN_PUBKEY' --role admin"
-fi
-
 # ---- systemd ---------------------------------------------------------------
 if [[ "$DO_SYSTEMD" -eq 1 ]]; then
   log "Installing unit"
@@ -325,27 +304,6 @@ Updating:
     && sudo systemctl restart buzz-relay
   (.env and the override are gitignored/untracked, so the pull leaves them alone.)
 
-Onboarding users — the easy way is an invite code:
-  Run ./mint-invite.sh (in this directory) to print an invite URL. Hand it to a
-  new user; they create their identity in the app, paste the URL into "Join a
-  community", and their pubkey is registered automatically on claim — they never
-  need to know their pubkey. Invites are stateless and multi-use, and expire in
-  72h (rotating BUZZ_RELAY_PRIVATE_KEY revokes all outstanding invites).
-
-The relay's key:
-  BUZZ_RELAY_PRIVATE_KEY in ${SRC}/.env is the RELAY'S OWN identity (plaintext,
-  file is 0600). It is NOT a personal login — do not paste it into a client.
-  To make yourself an admin instead of a plain member, either pass --admin <npub>
-  to this installer, or: buzz-admin add-member <your-npub> --role admin.
-
 Still yours to do: firewall port ${RELAY_PORT}, and TLS if this leaves a trusted LAN.
 ------------------------------------------------------------------------
 EOF
-
-# Best-effort: print a ready-to-use invite so the first user can join in one
-# paste. Never fails the install — the relay is already up by here.
-if [[ -x "$SCRIPT_DIR/mint-invite.sh" ]]; then
-  log "Minting a first invite (72h)…"
-  sudo -u "$RUN_USER" bash "$SCRIPT_DIR/mint-invite.sh" --dir "$INSTALL_DIR" \
-    || warn "Couldn't mint an invite yet — run ./mint-invite.sh once the relay is up."
-fi
