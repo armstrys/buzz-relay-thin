@@ -1,135 +1,185 @@
-# buzz-relay server deploy (thin)
+# Self-hosting a buzz relay
 
-Stand up a single-community [buzz](https://github.com/block/buzz) relay on one
-server. The relay is compiled from upstream and run **natively** under systemd;
-its datastores — Postgres, Redis, MinIO — run as Docker containers. The rest of
-the buzz monorepo (desktop app, agents, the extra dev services) is left out.
+Scripts to run one [buzz](https://github.com/block/buzz) relay on one server, for
+one community.
 
-Three tracked files plus a generated `.env`:
+The relay itself is compiled from the upstream source and runs directly on the
+machine under systemd. Its three datastores — Postgres, Redis, and MinIO — run
+as Docker containers alongside it. Nothing else from the buzz project (desktop
+app, agents, dev tooling) is installed.
 
-| File | Role |
-|---|---|
-| `install.sh` | Clones upstream, renders `.env`, builds the relay, starts the datastores, migrates + seeds, installs the systemd unit. |
-| `docker-compose.override.yml` | Merged over upstream's `docker-compose.yml` to bind the datastores to loopback and read their credentials and ports from `.env`. |
-| `buzz-relay.service` | systemd unit: apply migrations, then run the release binary as the main process. |
+## Before you start
+
+You need a Linux server with:
+
+- `git`, `docker`, and `openssl` installed, and the Docker daemon running
+- the Docker Compose plugin, **version 2.24 or newer** (`docker compose version`)
+- `sudo` access
+
+The relay is compiled from source, so expect the first install to take a while.
+You don't need to install Rust yourself — upstream ships its own toolchain via
+Hermit, which the installer activates if it's there, falling back to a
+system-installed `cargo` otherwise.
+
+You also need to decide on a hostname before installing — see
+[Choosing a hostname](#choosing-a-hostname).
 
 ## Install
+
+Copy this directory to the server and run the installer:
 
 ```
 scp -r buzz-relay-thin/ user@server:~/
 ssh user@server 'cd buzz-relay-thin && sudo ./install.sh --host relay.lan'
 ```
 
-`--host` is required and load-bearing: it becomes `RELAY_URL` and the seeded
-community host, and every client must connect with that exact authority (see
-[One host, one community](#one-host-one-community)).
+The installer clones the upstream buzz source into `/opt/buzz-relay/src`,
+generates an `.env` file with fresh random passwords, builds the relay, starts
+the datastore containers, sets up the database, and installs a systemd service
+that starts on boot.
 
-Re-running is safe. Generated secrets in `.env` are left untouched; only the
-host and ports are re-applied. Add `--update` to `git pull` the checkout before
-rebuilding.
+When it finishes, clients connect to `ws://relay.lan:3000`.
+
+Running the installer again is safe. It keeps your generated passwords and any
+settings you've edited on the server. Add `--update` to pull the latest upstream
+code and rebuild.
+
+## Choosing a hostname
+
+`--host` is the single most important decision here. **Every client must connect
+using exactly the hostname you pass.**
+
+The relay figures out which community a request belongs to by looking at the
+`Host` header. It only knows about the one hostname you seeded at install time,
+and refuses connections for anything else. So `relay.lan`, `relay.lan.`, an IP
+address, and a different DNS name are four different things as far as the relay
+is concerned — only one of them will work.
+
+Practical advice:
+
+- Use a stable DNS name, not a DHCP-assigned IP address.
+- If you later put the relay behind a TLS proxy and switch clients to `wss://`,
+  re-run `install.sh --host <new-hostname>` to register the new one.
+
+## Before you expose it to the internet
+
+Fresh installs come up as an **open relay** — `BUZZ_REQUIRE_AUTH_TOKEN=false` in
+`.env` means anyone who can reach the port can connect. That's convenient on a
+trusted LAN and wrong anywhere else. Set it to `true` and restart the service if
+your relay is reachable more widely.
+
+Two other things the installer deliberately leaves to you:
+
+- **Firewall.** Open the relay port (3000 by default). Leave the datastore ports
+  closed — they're bound to loopback and should stay that way.
+- **TLS.** Traffic is plain `ws://`. Outside a trusted network, terminate TLS in
+  a reverse proxy, serve `wss://`, and re-run the installer with `--host` set to
+  the new hostname.
 
 ## Ports
 
-The relay binds three ports on the host, and the datastores publish four more on
-loopback. On a shared box any of these can collide with something already
-running, so each is overridable. `install.sh` writes the value into `.env` and
-keeps the relay's own config and the published container ports in sync.
+Seven ports in total. Only the relay port is meant to be reachable from other
+machines; the rest bind to loopback.
 
-| Flag | Default | Service |
+| Flag | Default | What it is |
 |---|---|---|
-| `--port` | 3000 | relay (`RELAY_URL` / `BUZZ_BIND_ADDR`) — the only port meant to be reachable off-box |
-| `--health-port` | 8080 | relay health probe |
-| `--metrics-port` | 9102 | relay Prometheus exporter |
+| `--port` | 3000 | the relay — **the only port clients use** |
+| `--health-port` | 8080 | relay health check |
+| `--metrics-port` | 9102 | relay Prometheus metrics |
 | `--pg-port` | 5432 | Postgres |
 | `--redis-port` | 6379 | Redis |
-| `--minio-port` | 9000 | MinIO S3 API |
-| `--minio-console-port` | 9001 | MinIO console |
+| `--minio-port` | 9000 | MinIO (S3 API) |
+| `--minio-console-port` | 9001 | MinIO web console |
 
-On a crowded host, move the ones that clash:
+If something on the box already uses one of these, move it at install time:
 
 ```
 sudo ./install.sh --host relay.lan --port 3001 --health-port 8180
 ```
 
-Only the host-side port changes; container-internal ports stay fixed, so
-inter-container references such as MinIO's `minio:9000` keep working.
+Only the host-side port changes; the ports inside the containers stay fixed, so
+the services can still find each other.
 
-**The flags are for a fresh install; after that, `.env` on the box is the source
-of truth.** A re-run keeps whatever ports are already in `.env` and only changes
-one if you pass its flag again — so to move a port later you can either pass the
-flag, or just edit `/opt/buzz-relay/src/.env` and restart the service:
+**These flags only set defaults on a fresh install.** After that,
+`/opt/buzz-relay/src/.env` on the server is the source of truth. To change a
+port later, either pass the flag again or edit `.env` directly and restart:
 
 ```
 sudo systemctl restart buzz-relay                    # relay ports
 cd /opt/buzz-relay/src && docker compose up -d       # datastore ports
 ```
 
-Your edits survive the next `sudo ./install.sh --update`; they are not reset to
-the defaults.
+Either way, your changes survive the next `sudo ./install.sh --update`.
 
-## What it builds and starts
+## Check that it worked
 
-- **Builds** only `buzz-relay` and `buzz-admin` in release — not the workspace,
-  so no desktop or agent crates compile.
-- **Starts** only `postgres`, `redis`, `minio`, and the one-shot `minio-init`
-  bucket step. Upstream's dev-only services (Keycloak, Adminer, Prometheus) are
-  never brought up.
-- **Migrates and seeds** at install time via upstream's `just migrate`
-  (`buzz-admin migrate` plus the community-host seed script).
-
-## One host, one community
-
-The relay resolves a community from the incoming `Host` header and **fails
-closed** when no row matches — one row per host, one community per authority.
-So a single hostname has to agree everywhere: the value you pass to `--host`,
-the `ws://…` URL entered in every client, and the desktop app. Prefer a stable
-DNS name over a DHCP address. If you later front the relay with a TLS proxy and
-serve `wss://`, re-run `install.sh` with `--host` set to the new authority to
-seed that host.
-
-## The systemd unit
-
-`Type=simple`, running `target/release/buzz-relay` directly so the relay is the
-main PID and restart/signal handling stays clean. `ExecStartPre` re-applies
-migrations on every start using the compiled `buzz-admin migrate` binary —
-deliberately **not** `just migrate`, because `just` comes from Hermit, which
-needs a writable `$HOME/.cache` that this unit's hardening
-(`ProtectHome`/`ProtectSystem`) denies. Migrations are idempotent and the relay
-ensures its own community row at startup, so a boot with nothing to do is a
-no-op.
-
-Day-two operations:
-
-```
-systemctl {status,restart,stop} buzz-relay
-journalctl -u buzz-relay -f
-```
-
-## Verify
-
-Two log lines confirm a healthy start:
+Confirm the relay started cleanly:
 
 ```
 journalctl -u buzz-relay -n 200 | grep -E 'Config loaded|Deployment community ensured'
 ```
 
-`Config loaded` should show your `relay_url` and the three relay ports;
-`Deployment community ensured` should show `host=<your-host>:<port>`.
+`Config loaded` should show your relay URL and ports. `Deployment community
+ensured` should show `host=<your-host>:<port>`.
 
-Then confirm the override actually merged. It relies on the `!override` YAML tag,
-which needs **Docker Compose v2.24+**: without it, Compose *appends* port lists
-and the upstream `0.0.0.0` binding survives right next to the loopback one.
+Then confirm the datastores aren't exposed to the network:
 
 ```
 cd /opt/buzz-relay/src && docker compose config | grep -A3 ports
 ```
 
-Every published datastore port must carry a `127.0.0.1:` prefix. A bare binding
-means the override did not apply and your datastores are exposed to the network.
+Every published port must start with `127.0.0.1:`. If any is a bare port number,
+the Compose override didn't apply — almost always because Docker Compose is
+older than 2.24, which is the first version that understands the `!override` tag
+the override file uses. Without it, Compose *adds* the loopback binding next to
+upstream's `0.0.0.0` one instead of replacing it, and **your database is open to
+the network.** Upgrade Compose and re-run the installer.
 
-## Left to you
+## Day-to-day
 
-- Open the relay port in the host firewall. The datastore ports are bound to
-  loopback — keep them there.
-- Traffic is plain `ws://`. Off a trusted LAN, terminate TLS in a reverse proxy,
-  serve `wss://`, and re-run with `--host` set to the `wss://` authority.
+```
+systemctl status buzz-relay
+systemctl restart buzz-relay
+journalctl -u buzz-relay -f
+```
+
+To update to the latest upstream code, re-run the installer with `--update`, or
+do it by hand:
+
+```
+cd /opt/buzz-relay/src
+git pull && cargo build --release -p buzz-relay -p buzz-admin
+sudo systemctl restart buzz-relay
+```
+
+Your `.env` and the Compose override are untracked, so a pull leaves them alone.
+
+## What's in this repo
+
+| File | What it does |
+|---|---|
+| `install.sh` | Does everything above: clone, generate `.env`, build, start datastores, migrate, install the service. |
+| `docker-compose.override.yml` | Layered over upstream's `docker-compose.yml` to bind the datastores to loopback and read ports and passwords from `.env`. |
+| `buzz-relay.service` | The systemd unit — applies migrations, then runs the relay. |
+
+`.env` is generated on the server, not tracked here.
+
+## Notes on how it's put together
+
+Useful if you're modifying this, skippable otherwise.
+
+**Only two crates are built** — `buzz-relay` and `buzz-admin`, in release mode.
+Building the whole workspace would drag in the desktop app and agent crates that
+a relay box has no use for.
+
+**Only four containers start** — `postgres`, `redis`, `minio`, and a one-shot
+`minio-init` that creates the storage bucket. Upstream's dev-only services
+(Keycloak, Adminer, Prometheus) never come up.
+
+**The systemd unit runs the binary directly** (`Type=simple`), so the relay is
+the main process and signal handling stays clean. `ExecStartPre` re-applies
+migrations on every start using the compiled `buzz-admin migrate` rather than
+upstream's `just migrate` — `just` comes from Hermit, which wants a writable
+`$HOME/.cache` that the unit's sandboxing (`ProtectHome`, `ProtectSystem`)
+blocks. Migrations are idempotent, so a restart with nothing to do costs
+nothing.
