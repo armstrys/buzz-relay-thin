@@ -197,13 +197,57 @@ CADDY_HTTPS_PORT=443
 EOF
 chmod 600 "$ENV_FILE"
 
+# Print the owner key BEFORE starting anything. The private key exists only in
+# this process; if the stack fails to come up and we exit first, it is gone.
+if [[ -n "$OWNER_PRIVKEY" ]]; then
+  cat <<EOF
+
+------------------------------------------------------------------------
+Owner keypair — SHOWN ONCE, NOT STORED. Save the private key now.
+
+  public  (in .env): $OWNER_PUBKEY
+  private (yours):   $OWNER_PRIVKEY
+
+Import the private key into your Nostr client to administer this relay.
+------------------------------------------------------------------------
+
+EOF
+fi
+
 # ---- hand off to upstream ----------------------------------------------------
-log "Starting the stack via upstream run.sh"
+# run.sh picks its compose files from BUZZ_COMPOSE_TLS in the environment, not
+# from .env — so a TLS install must set it on every later invocation too, or
+# Caddy silently drops out of the stack and the relay republishes its port.
+PREFIX=""
 if [[ "$DO_TLS" -eq 1 ]]; then
   log "TLS on — make sure $RELAY_HOST resolves here and 80/443 are open."
   export BUZZ_COMPOSE_TLS=true
+  PREFIX="BUZZ_COMPOSE_TLS=true "
 fi
-"$COMPOSE_DIR/run.sh" start
+
+log "Starting the stack via upstream run.sh"
+if ! "$COMPOSE_DIR/run.sh" start; then
+  cat >&2 <<EOF
+
+------------------------------------------------------------------------
+The stack failed to start, but $ENV_FILE is written and valid.
+
+Do NOT re-run install.sh — it refuses when .env exists. Fix the problem and
+retry the start directly:
+
+  cd $COMPOSE_DIR && ${PREFIX}./run.sh start
+
+If a host port is already taken (the usual cause), find the holder with:
+
+  sudo ss -lntp | grep -E ':(80|443|$RELAY_PORT)\b'
+
+An older bare-metal install leaves a systemd unit holding the relay port:
+
+  sudo systemctl disable --now buzz-relay
+------------------------------------------------------------------------
+EOF
+  exit 1
+fi
 
 cat <<EOF
 
@@ -212,21 +256,9 @@ Buzz relay is up ($RELAY_MODE).
 
   Clients:  $WS_URL
   Config:   $ENV_FILE  (0600 — back this up)
-  Manage:   cd $COMPOSE_DIR && ./run.sh help
+  Manage:   cd $COMPOSE_DIR && ${PREFIX}./run.sh help
 ------------------------------------------------------------------------
 EOF
-
-if [[ -n "$OWNER_PRIVKEY" ]]; then
-  cat <<EOF
-Owner keypair — SHOWN ONCE, NOT STORED. Save the private key now.
-
-  public  (in .env): $OWNER_PUBKEY
-  private (yours):   $OWNER_PRIVKEY
-
-Import the private key into your Nostr client to administer this relay.
-
-EOF
-fi
 
 if [[ "$RELAY_MODE" == "open" ]]; then
   cat <<EOF
