@@ -27,16 +27,8 @@ rather than a startup error.
 hostname out correctly, optionally mints an owner keypair, and hands off to
 upstream's `run.sh`. It does not wrap, replace, or shadow anything else.
 
-After install, this repo is done. Manage the relay with upstream's tooling:
-
-```bash
-cd /opt/buzz-relay/src/deploy/compose
-./run.sh logs      # follow relay logs
-./run.sh status    # container status
-./run.sh upgrade   # pull latest image and restart
-./run.sh stop      # stop, keeping volumes
-./run.sh help      # everything else, incl. add-member / list-members
-```
+After install, this repo is done. Everything from then on is upstream's
+`run.sh` — see [Managing the relay](#managing-the-relay).
 
 ## Requirements
 
@@ -117,6 +109,132 @@ Changing it later means reinstalling.
 
 Pin `--image-tag` to a `sha-<7>` or semver tag for production; `main` tracks
 upstream's pre-release builds.
+
+## Managing the relay
+
+Everything after install is upstream's `run.sh`, which lives beside the config:
+
+```bash
+cd /opt/buzz-relay/src/deploy/compose
+./run.sh help
+```
+
+| Command | |
+|---|---|
+| `./run.sh status` | container status |
+| `./run.sh logs [svc]` | follow logs (default: `relay`) |
+| `./run.sh restart` | recreate the relay after editing `.env` |
+| `./run.sh upgrade` | pull the latest image, restart, print backup reminders |
+| `./run.sh stop` | stop containers, keep volumes |
+| `./run.sh add-member <npub-or-hex>` | add a member to a closed relay |
+| `./run.sh list-members` | list members |
+
+Full reference: [`deploy/compose/README.md`](https://github.com/block/buzz/blob/main/deploy/compose/README.md)
+in the upstream repo.
+
+### If you installed with `--tls`, prefix every command
+
+`run.sh` decides which compose files to load from the `BUZZ_COMPOSE_TLS`
+environment variable. It does **not** read this from `.env`, so it has no
+memory of how you installed:
+
+```bash
+BUZZ_COMPOSE_TLS=true ./run.sh upgrade
+```
+
+Forget the prefix and `run.sh` loads only `compose.yml` — Caddy drops out of
+the stack and the relay republishes port 3000 directly, unencrypted. Verify
+with `./run.sh config | grep published`: you should see `80` and `443`, never
+`3000`. Consider adding `export BUZZ_COMPOSE_TLS=true` to your shell profile on
+a TLS host.
+
+### Upgrades
+
+```bash
+cd /opt/buzz-relay/src/deploy/compose
+./run.sh upgrade          # add BUZZ_COMPOSE_TLS=true if you installed with --tls
+```
+
+That pulls the image named by `BUZZ_IMAGE` in `.env`, recreates containers, and
+prints the backup checklist. Your `.env` is untouched, so secrets and relay
+identity survive. `BUZZ_AUTO_MIGRATE=true` means schema migrations run on
+startup.
+
+Two things worth knowing:
+
+- **`main` is a moving tag.** A fresh install pins `BUZZ_IMAGE=ghcr.io/block/buzz:main`,
+  so `upgrade` pulls whatever upstream built most recently, untested against
+  your data. For anything you care about, edit `BUZZ_IMAGE` in `.env` to a
+  `sha-<7>` or semver tag and bump it deliberately.
+- **Back up before upgrading**, not after. Run `./run.sh backup-hint` for the
+  checklist — it covers `.env`, Postgres, MinIO, and the git volume.
+
+To roll back, set `BUZZ_IMAGE` to the previous tag and `./run.sh upgrade`
+again. Note that a migration applied by the newer image is not undone by
+downgrading, which is the other reason to snapshot Postgres first.
+
+## Uninstall / start over
+
+Tear down containers, volumes, and network, then remove the files. The
+subshell keeps your own shell out of a directory that's about to be deleted:
+
+```bash
+(cd /opt/buzz-relay/src/deploy/compose \
+  && sudo docker compose --env-file .env -f compose.yml -f compose.caddy.yml \
+       down -v --remove-orphans)
+
+sudo rm -rf /opt/buzz-relay
+```
+
+Both `-f` flags are intentional — without `compose.caddy.yml` the two Caddy
+volumes survive. `-v` destroys all relay data. Order matters: Compose needs
+`.env` and the compose files, so tear down before deleting.
+
+If the install died partway and `.env` is missing or broken, Compose can't
+parse the files at all. Remove by project label instead:
+
+```bash
+sudo docker rm -f $(docker ps -aq --filter label=com.docker.compose.project=buzz-prod) 2>/dev/null
+docker volume ls -q --filter name=buzz-prod | xargs -r sudo docker volume rm
+docker network ls -q --filter name=buzz-prod | xargs -r sudo docker network rm
+```
+
+Everything this creates lives under the Compose project `buzz-prod`, so that
+label is the complete handle. Confirm you're clean:
+
+```bash
+docker ps -a --filter name=buzz --format '{{.Names}}'
+docker volume ls | grep buzz
+sudo ss -lntp | grep -E ':(80|443|3000)\b'
+```
+
+## Troubleshooting
+
+**`port is already allocated` on startup.** Something else holds the port. Find
+it with `sudo ss -lntp | grep :3000`. The usual culprit is an older bare-metal
+install whose systemd unit is still running — note that deleting the binary
+does not stop a running process:
+
+```bash
+sudo systemctl disable --now buzz-relay
+sudo rm -f /etc/systemd/system/buzz-relay.service
+sudo systemctl daemon-reload
+```
+
+Then start the stack directly — **don't re-run `install.sh`**, which refuses
+when `.env` exists:
+
+```bash
+cd /opt/buzz-relay/src/deploy/compose && ./run.sh start
+```
+
+**`couldn't find env file`.** You're in the wrong directory. Every `run.sh` and
+`docker compose` command has to run from `/opt/buzz-relay/src/deploy/compose`.
+
+**Certificate errors with `--tls`.** Public CAs only issue for publicly
+resolvable names. A single-label host like `myserver` doesn't qualify, so Caddy
+falls back to its internal CA and clients reject the self-signed cert. Either
+use a real DNS name or drop `--tls`. Check with `./run.sh logs caddy`.
 
 ## Back this up
 
