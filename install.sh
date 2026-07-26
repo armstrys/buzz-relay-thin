@@ -25,6 +25,7 @@ IMAGE_TAG="${BUZZ_IMAGE_TAG:-main}"
 RELAY_HOST=""
 RELAY_PORT=3000
 DO_TLS=0
+EXTERNAL_TLS=0
 GEN_OWNER=0
 DO_OPEN=0
 OWNER_PUBKEY=""
@@ -42,7 +43,11 @@ Required:
 
 Options:
   --port N           Relay port on the host (default 3000, ignored with --tls)
-  --tls              Add Caddy for automatic HTTPS on 80/443
+  --tls              Add Caddy for automatic HTTPS on 80/443 (needs a public
+                     DNS name reachable from the internet on 80/443)
+  --external-tls     TLS is terminated by something else (Tailscale, an
+                     existing reverse proxy). Publishes the relay port as
+                     normal but writes wss:// URLs. Use this for LAN + mobile.
   --owner HEX        64-char hex Nostr pubkey; makes this a closed relay
   --generate-owner   Generate an owner keypair and make this a closed relay
   --open             Run with NO access control (see the warning below)
@@ -78,6 +83,7 @@ while [[ $# -gt 0 ]]; do
     --host)           RELAY_HOST="$2"; shift 2 ;;
     --port)           RELAY_PORT="$2"; shift 2 ;;
     --tls)            DO_TLS=1; shift ;;
+    --external-tls)   EXTERNAL_TLS=1; shift ;;
     --owner)          OWNER_PUBKEY="$2"; shift 2 ;;
     --generate-owner) GEN_OWNER=1; shift ;;
     --open)           DO_OPEN=1; shift ;;
@@ -127,6 +133,23 @@ for cmd in git docker openssl; do
 done
 docker compose version >/dev/null 2>&1 || die "Docker Compose plugin not found."
 docker info >/dev/null 2>&1 || die "Docker daemon not reachable."
+
+if [[ "$DO_TLS" -eq 1 && "$EXTERNAL_TLS" -eq 1 ]]; then
+  die "--tls and --external-tls are mutually exclusive."
+fi
+
+# Let's Encrypt only issues for publicly resolvable names. Caddy silently falls
+# back to its internal CA for anything else, and mobile platforms will not trust
+# that: Android ignores user-installed CAs unless the app opts in.
+if [[ "$DO_TLS" -eq 1 && "$RELAY_HOST" != *.* ]]; then
+  die "--tls needs a public DNS name; '$RELAY_HOST' has no dot.
+
+Let's Encrypt cannot issue for a single-label name, so Caddy would fall back to
+a self-signed internal CA that phones reject.
+
+For a LAN relay that mobile clients must reach, terminate TLS elsewhere and use
+--external-tls (see the README's 'TLS on a LAN' section)."
+fi
 
 # compose.caddy.yml uses the !reset tag, which needs Compose v2.24.4+.
 if [[ "$DO_TLS" -eq 1 ]]; then
@@ -194,8 +217,11 @@ fi
 [[ -f "$COMPOSE_DIR/run.sh" ]] || die "Upstream has no deploy/compose bundle at $COMPOSE_DIR."
 
 # ---- .env --------------------------------------------------------------------
-if [[ "$DO_TLS" -eq 1 ]]; then
-  WS_URL="wss://$RELAY_HOST"        # Caddy terminates TLS on 443; no port suffix
+if [[ "$DO_TLS" -eq 1 || "$EXTERNAL_TLS" -eq 1 ]]; then
+  # Caddy (or the external terminator) serves 443; no port suffix in the URLs.
+  # With --external-tls the relay still publishes $RELAY_PORT for the
+  # terminator to forward to — that port just is not what clients dial.
+  WS_URL="wss://$RELAY_HOST"
   HTTP_URL="https://$RELAY_HOST"
 else
   WS_URL="ws://$RELAY_HOST:$RELAY_PORT"
@@ -296,6 +322,11 @@ if [[ "$DO_TLS" -eq 1 ]]; then
   log "TLS on — make sure $RELAY_HOST resolves here and 80/443 are open."
   export BUZZ_COMPOSE_TLS=true
   PREFIX="BUZZ_COMPOSE_TLS=true "
+fi
+
+if [[ "$EXTERNAL_TLS" -eq 1 ]]; then
+  log "External TLS: point your terminator at 127.0.0.1:$RELAY_PORT"
+  log "Clients will use $WS_URL — it must send Host: $RELAY_HOST"
 fi
 
 log "Starting the stack via upstream run.sh"

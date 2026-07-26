@@ -105,6 +105,67 @@ to `wss://buzz.example.com` with no port.
 The hostname must resolve to this machine publicly and 80/443 must be open, or
 certificate issuance fails.
 
+## TLS on a LAN (required for mobile)
+
+The mobile app cannot use `ws://`, and that's the operating system, not the
+app: Android denies cleartext by default since API 28 (the manifest sets no
+`usesCleartextTraffic`), and iOS ATS denies it with no exception in
+`Info.plist`. The invite-link path additionally accepts only `https`/`wss`.
+
+`--tls` does **not** solve this on a LAN. It uses Let's Encrypt, which must
+reach your box from the internet on 80/443. `install.sh` now refuses `--tls`
+for a hostname with no dot, because Caddy would quietly fall back to a
+self-signed internal CA — and phones reject that. Android ignores
+user-installed CAs unless an app explicitly opts in, so "just install the root
+cert" does not work there.
+
+What does work is terminating TLS with something that already holds a publicly
+trusted certificate, then pointing it at the relay:
+
+```bash
+sudo ./install.sh --host <public-name> --port 3001 --external-tls --generate-owner
+```
+
+`--external-tls` still publishes the relay on `--port` for your terminator to
+forward to, but writes `wss://` / `https://` URLs with no port, since clients
+dial 443.
+
+### Tailscale (easiest, no domain needed)
+
+Tailscale issues real Let's Encrypt certificates for `*.ts.net` names, so
+phones on your tailnet trust them with nothing installed, and nothing is
+exposed to the internet.
+
+```bash
+tailscale up
+tailscale cert "$(tailscale status --json | jq -r .Self.DNSName | sed 's/\.$//')"
+tailscale serve --bg --https=443 http://127.0.0.1:3001
+```
+
+Then install with that name:
+
+```bash
+sudo ./install.sh --host <machine>.<tailnet>.ts.net --port 3001 \
+  --external-tls --generate-owner
+```
+
+Requires HTTPS enabled for your tailnet (admin console → DNS → HTTPS
+Certificates). Clients connect to `wss://<machine>.<tailnet>.ts.net`.
+
+### Your own domain, DNS-01
+
+If you own a domain, point a record at the LAN IP (a private address in public
+DNS is fine) and issue via the DNS-01 challenge, which needs no inbound
+reachability. Caddy can do this, but `caddy:2-alpine` ships without DNS
+provider plugins, so it means building a custom Caddy image rather than using
+upstream's `compose.caddy.yml` — then run the relay with `--external-tls`.
+
+### Whatever you pick, the name is the identity
+
+The relay keys communities off the `Host` header, so the hostname you install
+with must be exactly what clients dial, and your terminator must forward that
+`Host` through unchanged. Switching names later means reinstalling.
+
 ## Ports
 
 Only the relay port is published:
@@ -134,7 +195,8 @@ Changing it later means reinstalling.
 | `--host HOST` | *(required)* | Hostname clients connect to |
 | *(access model)* | *(required)* | One of `--generate-owner`, `--owner`, `--open` |
 | `--port N` | 3000 | Relay port (ignored with `--tls`) |
-| `--tls` | off | Caddy reverse proxy, automatic HTTPS |
+| `--tls` | off | Caddy reverse proxy, automatic HTTPS (public DNS name only) |
+| `--external-tls` | off | TLS terminated elsewhere; write `wss://` URLs |
 | `--owner HEX` | — | 64-char hex Nostr pubkey; closed relay |
 | `--generate-owner` | — | Mint an owner keypair; closed relay |
 | `--open` | — | **No access control.** Required to opt in; see above |
