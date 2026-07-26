@@ -270,6 +270,36 @@ To roll back, set `BUZZ_IMAGE` to the previous tag and `./run.sh upgrade`
 again. Note that a migration applied by the newer image is not undone by
 downgrading, which is the other reason to snapshot Postgres first.
 
+### Adding agents and other non-desktop clients
+
+The relay's invite flow is HTTP-only: an owner or admin mints a code with
+`POST /api/invites` and the joiner redeems it with `POST /api/invites/claim`,
+both NIP-98 signed. The desktop app drives both ends (Settings → community
+members → Invite → *Copy link*), but `buzz` the CLI exposes **neither** — there
+is no `buzz invite` or `buzz join`. So anything headless that authenticates with
+`BUZZ_PRIVATE_KEY` — bridge agents, bots, CI — cannot claim an invite today.
+
+Until that lands, add them from the relay host instead:
+
+```bash
+sudo /opt/buzz-relay/src/deploy/compose/run.sh add-member <npub-or-hex>
+```
+
+`run.sh` `cd`s to its own directory first, so the absolute path works from
+anywhere; no need to `cd` yourself. This path bypasses the invite system
+entirely — it `exec`s `buzz-admin` inside the relay container, so it needs no
+admin key at all, only root on the box. You do need the client's pubkey
+out-of-band, which is the one thing invites exist to avoid. The CLI has no
+`whoami`, so have the agent's operator read it off the key they configured
+(`BUZZ_PRIVATE_KEY` accepts hex or nsec).
+
+Add `--role admin` to let that identity mint invites of its own. `--role owner`
+is rejected; ownership only moves by changing `RELAY_OWNER_PUBKEY`.
+
+When adding several, put `sleep 1` between calls and do not parallelize — the
+kind:13534 roster event upstream publishes on each add is timestamped to the
+second, and same-second adds collide.
+
 ## Uninstall / start over
 
 Tear down containers, volumes, and network, then remove the files. The
