@@ -27,6 +27,7 @@ RELAY_PORT=3000
 DO_TLS=0
 GEN_OWNER=0
 OWNER_PUBKEY=""
+CORS_ORIGINS=""
 
 log()  { printf '\033[1;33m[relay]\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m[relay] error:\033[0m %s\n' "$*" >&2; exit 1; }
@@ -43,6 +44,11 @@ Options:
   --tls              Add Caddy for automatic HTTPS on 80/443
   --owner HEX        64-char hex Nostr pubkey; makes this a closed relay
   --generate-owner   Generate an owner keypair and make this a closed relay
+  --cors-origins CSV Restrict CORS to these origins (default: allow any).
+                     Only set this if a browser app on a known origin is your
+                     only client — the Tauri desktop app's origin is
+                     tauri://localhost, not the relay URL, so pinning this to
+                     the relay URL blocks it.
   --image-tag TAG    ghcr.io/block/buzz tag (default: main)
   --dir PATH         Install root (default: /opt/buzz-relay)
   -h, --help         Show this help
@@ -60,6 +66,7 @@ while [[ $# -gt 0 ]]; do
     --tls)            DO_TLS=1; shift ;;
     --owner)          OWNER_PUBKEY="$2"; shift 2 ;;
     --generate-owner) GEN_OWNER=1; shift ;;
+    --cors-origins)   CORS_ORIGINS="$2"; shift 2 ;;
     --image-tag)      IMAGE_TAG="$2"; shift 2 ;;
     --dir)            INSTALL_DIR="$2"; shift 2 ;;
     -h|--help)        usage; exit 0 ;;
@@ -162,6 +169,20 @@ else
   HTTP_URL="http://$RELAY_HOST:$RELAY_PORT"
 fi
 
+# The relay treats an empty BUZZ_CORS_ORIGINS as permissive and a non-empty one
+# as a strict allowlist. Default to permissive: the desktop client is Tauri, so
+# its origin is tauri://localhost (macOS) or http://tauri.localhost (elsewhere)
+# — never the relay's own URL. Pinning the relay URL here blocks the app, which
+# surfaces in the client as a bare "Load failed".
+if [[ -n "$CORS_ORIGINS" ]]; then
+  CORS_LINE="BUZZ_CORS_ORIGINS=$CORS_ORIGINS"
+else
+  CORS_LINE="# Empty = permissive (any origin). The Tauri desktop client's origin is
+# tauri://localhost, not $HTTP_URL, so an allowlist must include it.
+# Re-run with --cors-origins to restrict this.
+BUZZ_CORS_ORIGINS="
+fi
+
 if [[ -n "$OWNER_PUBKEY" ]]; then
   RELAY_MODE="closed"; AUTH=true;  MEMBERSHIP=true;  NIP_OA=true
 else
@@ -182,7 +203,7 @@ BUZZ_DOMAIN=$RELAY_HOST
 RELAY_URL=$WS_URL
 BUZZ_MEDIA_BASE_URL=$HTTP_URL/media
 BUZZ_MEDIA_SERVER_DOMAIN=$RELAY_HOST
-BUZZ_CORS_ORIGINS=$HTTP_URL
+$CORS_LINE
 
 BUZZ_REQUIRE_AUTH_TOKEN=$AUTH
 BUZZ_REQUIRE_RELAY_MEMBERSHIP=$MEMBERSHIP

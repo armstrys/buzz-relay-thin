@@ -104,6 +104,7 @@ Changing it later means reinstalling.
 | `--tls` | off | Caddy reverse proxy, automatic HTTPS |
 | `--owner HEX` | — | 64-char hex Nostr pubkey; closed relay |
 | `--generate-owner` | off | Mint an owner keypair; closed relay |
+| `--cors-origins CSV` | *(unset = any)* | Restrict CORS to these origins |
 | `--image-tag TAG` | `main` | `ghcr.io/block/buzz` tag |
 | `--dir PATH` | `/opt/buzz-relay` | Install root |
 
@@ -243,6 +244,20 @@ it on an older version:
 
 Always tear down with `down -v` before removing the install directory, not
 after — Compose needs the files to know what to delete.
+
+**Client says "Load failed" but `curl http://host:port/_liveness` returns
+`ok`.** That's CORS. The relay treats an empty `BUZZ_CORS_ORIGINS` as permissive
+and a non-empty one as a strict allowlist. The desktop app is Tauri, so its
+browser origin is `tauri://localhost` (macOS) or `http://tauri.localhost`
+(Windows/Linux) — never the relay's own URL. Fresh installs leave the variable
+empty for this reason; if yours has a value that doesn't include the client's
+origin, clear it:
+
+```bash
+cd /opt/buzz-relay/src/deploy/compose
+sed -i 's|^BUZZ_CORS_ORIGINS=.*|BUZZ_CORS_ORIGINS=|' .env
+./run.sh restart
+```
 
 **`couldn't find env file`.** You're in the wrong directory. Every `run.sh` and
 `docker compose` command has to run from `/opt/buzz-relay/src/deploy/compose`.
