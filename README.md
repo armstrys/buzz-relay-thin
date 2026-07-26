@@ -228,6 +228,22 @@ when `.env` exists:
 cd /opt/buzz-relay/src/deploy/compose && ./run.sh start
 ```
 
+**`container buzz-prod-relay-1 is unhealthy` after reinstalling.** Docker
+volumes outlive `rm -rf /opt/buzz-relay`. If a previous install's
+`buzz-prod_buzz-postgres-data` survived, Postgres still holds the *old*
+password while the new `.env` has a freshly generated one — the relay starts,
+can't authenticate, and fails its readiness probe with nothing useful in the
+compose output. `install.sh` now refuses to start in this state, but if you hit
+it on an older version:
+
+```bash
+(cd /opt/buzz-relay/src/deploy/compose \
+  && docker compose --env-file .env -f compose.yml down -v --remove-orphans)
+```
+
+Always tear down with `down -v` before removing the install directory, not
+after — Compose needs the files to know what to delete.
+
 **`couldn't find env file`.** You're in the wrong directory. Every `run.sh` and
 `docker compose` command has to run from `/opt/buzz-relay/src/deploy/compose`.
 

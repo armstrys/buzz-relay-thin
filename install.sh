@@ -107,6 +107,25 @@ To start over, remove $INSTALL_DIR first (this destroys the config, not the
 Docker volumes; see 'docker volume ls' for those)."
 fi
 
+# Docker volumes outlive `rm -rf` of the install dir. This install generates new
+# secrets, which will not match the credentials already baked into a surviving
+# Postgres volume — the relay starts, fails to authenticate, and reports only
+# "container buzz-prod-relay-1 is unhealthy". Refuse instead.
+STALE="$(docker volume ls -q --filter name=buzz-prod_ 2>/dev/null || true)"
+if [[ -n "$STALE" ]]; then
+  die "Volumes from a previous install are still present:
+
+$(printf '  %s\n' $STALE)
+Fresh secrets will not match the credentials stored in them, so the relay
+would come up unhealthy. Remove them first (this destroys the old data):
+
+  docker volume rm $(printf '%s ' $STALE)
+
+If a previous stack is still running, tear it down properly instead:
+
+  (cd $COMPOSE_DIR && docker compose --env-file .env -f compose.yml down -v)"
+fi
+
 # ---- owner keypair -----------------------------------------------------------
 # Nostr pubkeys are BIP340 x-only: the x coordinate of privkey * G.
 OWNER_PRIVKEY=""
