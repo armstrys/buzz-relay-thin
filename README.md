@@ -6,10 +6,11 @@ relay.
 ```bash
 git clone https://github.com/armstrys/buzz-relay-thin.git
 cd buzz-relay-thin
-sudo ./install.sh --host relay.lan
+sudo ./install.sh --host relay.lan --generate-owner
 ```
 
-The relay comes up at `ws://relay.lan:3000`.
+The relay comes up at `ws://relay.lan:3000`, closed, with you as the owner.
+Save the private key it prints — it appears once.
 
 ## What this is (and isn't)
 
@@ -36,28 +37,59 @@ A Linux host with `git`, `openssl`, Docker, and the Compose plugin. Use `sudo`
 if installing to the default `/opt/buzz-relay`, or pass `--dir` to somewhere
 you own. TLS additionally needs Compose 2.24.4+ (checked at install time).
 
-## Open vs closed
+## Open vs closed — read this before choosing
 
-By default the relay is **open** — no auth token, no membership check. Anyone
-who can reach the port can connect. That's the right default for a trusted LAN
-and the wrong one for the public internet.
+`install.sh` refuses to run until you pick one. There is no default, because
+the wrong choice is not recoverable.
 
-For a closed relay, give it an owner:
+### Closed (recommended)
 
 ```bash
-# You already have a Nostr identity (64-char hex pubkey, not an npub):
-sudo ./install.sh --host buzz.example.com --tls --owner <hex>
+# Mint an owner keypair:
+sudo ./install.sh --host relay.lan --generate-owner
 
-# You don't, and want one generated:
-sudo ./install.sh --host buzz.example.com --tls --generate-owner
+# Or use a Nostr identity you already have (64-char hex, not an npub):
+sudo ./install.sh --host relay.lan --owner <hex>
 ```
 
-Either sets `RELAY_OWNER_PUBKEY` and turns on `BUZZ_REQUIRE_AUTH_TOKEN`,
-`BUZZ_REQUIRE_RELAY_MEMBERSHIP`, and `BUZZ_ALLOW_NIP_OA_AUTH`.
+Sets `RELAY_OWNER_PUBKEY` and turns on `BUZZ_REQUIRE_AUTH_TOKEN`,
+`BUZZ_REQUIRE_RELAY_MEMBERSHIP`, and `BUZZ_ALLOW_NIP_OA_AUTH`. Everyone else
+must be added explicitly:
 
-`--generate-owner` prints the private key **once** and does not store it. Save
-it immediately, then import it into your Nostr client — that key is how you
-administer the relay.
+```bash
+cd /opt/buzz-relay/src/deploy/compose
+./run.sh add-member <npub-or-hex>
+```
+
+`--generate-owner` prints the private key **once** and never stores it. Save it
+before you close the terminal — that key is how you administer the relay.
+
+### Open — no access control at all
+
+```bash
+sudo ./install.sh --host relay.lan --open
+```
+
+This does **not** merely mean "anyone can connect". With no membership
+requirement, "authenticated" means nothing more than completing NIP-42 AUTH,
+which anyone can do with a keypair generated on the spot. That key can then:
+
+- **create channels** — `validate_admin_event` returns `Ok(())` for kind 9007
+  before performing any check
+- **join any public channel**, and **add other people to it** — the relay's own
+  comment reads *"open channels allow any authenticated user"*
+- **grant itself `owner` or `admin` on any public channel** — the
+  "only owners/admins may grant elevated roles" check runs only inside the
+  `if channel.visibility == "private"` branch
+- **kick members and delete messages**, once it holds one of those roles
+
+None of it is revocable, because there is no identity to revoke. Anyone who can
+route a packet to the port is effectively an administrator of every public
+channel.
+
+Use `--open` only where you would be comfortable handing every device on the
+network admin over every channel. Private channels are meaningfully protected;
+public ones are not.
 
 ## TLS
 
@@ -100,10 +132,12 @@ Changing it later means reinstalling.
 | Flag | Default | What it does |
 |---|---|---|
 | `--host HOST` | *(required)* | Hostname clients connect to |
+| *(access model)* | *(required)* | One of `--generate-owner`, `--owner`, `--open` |
 | `--port N` | 3000 | Relay port (ignored with `--tls`) |
 | `--tls` | off | Caddy reverse proxy, automatic HTTPS |
 | `--owner HEX` | — | 64-char hex Nostr pubkey; closed relay |
-| `--generate-owner` | off | Mint an owner keypair; closed relay |
+| `--generate-owner` | — | Mint an owner keypair; closed relay |
+| `--open` | — | **No access control.** Required to opt in; see above |
 | `--cors-origins CSV` | *(unset = any)* | Restrict CORS to these origins |
 | `--image-tag TAG` | `main` | `ghcr.io/block/buzz` tag |
 | `--dir PATH` | `/opt/buzz-relay` | Install root |

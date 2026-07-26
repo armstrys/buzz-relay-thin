@@ -26,6 +26,7 @@ RELAY_HOST=""
 RELAY_PORT=3000
 DO_TLS=0
 GEN_OWNER=0
+DO_OPEN=0
 OWNER_PUBKEY=""
 CORS_ORIGINS=""
 
@@ -44,6 +45,7 @@ Options:
   --tls              Add Caddy for automatic HTTPS on 80/443
   --owner HEX        64-char hex Nostr pubkey; makes this a closed relay
   --generate-owner   Generate an owner keypair and make this a closed relay
+  --open             Run with NO access control (see the warning below)
   --cors-origins CSV Restrict CORS to these origins (default: allow any).
                      Only set this if a browser app on a known origin is your
                      only client — the Tauri desktop app's origin is
@@ -53,9 +55,21 @@ Options:
   --dir PATH         Install root (default: /opt/buzz-relay)
   -h, --help         Show this help
 
-Without --owner or --generate-owner the relay comes up OPEN: anyone who can
-reach the port can connect. That is fine on a trusted LAN and wrong on the
-public internet.
+You must choose an access model: --owner / --generate-owner (closed), or --open.
+
+--open does NOT just mean "anyone can connect". It means anyone who can reach
+the port can generate a throwaway keypair and then:
+
+  * create channels
+  * join any public channel
+  * add other people to public channels
+  * grant themselves owner/admin on a public channel, because the relay only
+    enforces the elevated-role check on PRIVATE channels
+  * once owner/admin: kick members and delete messages
+
+There is no identity to revoke, because there is no identity. Use --open only
+on a network where you would be comfortable handing every device admin over
+every channel.
 EOF
 }
 
@@ -66,6 +80,7 @@ while [[ $# -gt 0 ]]; do
     --tls)            DO_TLS=1; shift ;;
     --owner)          OWNER_PUBKEY="$2"; shift 2 ;;
     --generate-owner) GEN_OWNER=1; shift ;;
+    --open)           DO_OPEN=1; shift ;;
     --cors-origins)   CORS_ORIGINS="$2"; shift 2 ;;
     --image-tag)      IMAGE_TAG="$2"; shift 2 ;;
     --dir)            INSTALL_DIR="$2"; shift 2 ;;
@@ -78,6 +93,24 @@ done
 
 if [[ -n "$OWNER_PUBKEY" && "$GEN_OWNER" -eq 1 ]]; then
   die "Use either --owner or --generate-owner, not both."
+fi
+
+# Open mode grants channel admin to any anonymous key, so it must be explicit —
+# never something you get by forgetting an argument.
+if [[ "$DO_OPEN" -eq 1 && ( -n "$OWNER_PUBKEY" || "$GEN_OWNER" -eq 1 ) ]]; then
+  die "--open conflicts with --owner/--generate-owner."
+fi
+if [[ "$DO_OPEN" -eq 0 && -z "$OWNER_PUBKEY" && "$GEN_OWNER" -eq 0 ]]; then
+  die "Choose an access model.
+
+  --generate-owner   closed relay, mint an owner keypair   (recommended)
+  --owner <hex>      closed relay, use a key you already have
+  --open             NO access control
+
+--open is not just 'anyone can connect'. Any anonymous key can create channels,
+add people to public channels, and grant itself owner/admin on a public channel
+(the relay only enforces the elevated-role check on private channels).
+Run ./install.sh --help for the full description."
 fi
 
 if [[ -n "$OWNER_PUBKEY" ]]; then
@@ -302,9 +335,20 @@ EOF
 
 if [[ "$RELAY_MODE" == "open" ]]; then
   cat <<EOF
-This relay is OPEN — no auth, no membership check. Fine on a trusted LAN.
-Before exposing it to the internet, re-install with --generate-owner (or
---owner <hex>) to get a closed relay.
+!! THIS RELAY HAS NO ACCESS CONTROL !!
+
+Anyone who can reach $RELAY_HOST:$RELAY_PORT can generate a keypair and:
+  - create channels
+  - join any public channel, and add other people to it
+  - make themselves owner/admin of any PUBLIC channel (the relay only enforces
+    the elevated-role check on private channels)
+  - then kick members and delete messages
+
+Nothing here is revocable, because there are no identities to revoke. Treat
+every device that can route to this port as a full administrator.
+
+To close it, reinstall with --generate-owner and add members explicitly:
+  ./run.sh add-member <npub-or-hex>
 
 EOF
 fi
