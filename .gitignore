@@ -1,8 +1,9 @@
-# Rendered env with generated secrets (install.sh writes this into the checkout)
+# Generated env with secrets (install.sh writes this into the upstream checkout)
 .env
 *.env
-!env.template
+
+# Upstream clone (install.sh clones into /opt/buzz-relay/src by default, but
+# a local ./src can appear during development)
 src/
-docker-compose.relay.yml
-*.bak
+
 .DS_Store

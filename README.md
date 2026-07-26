@@ -1,185 +1,141 @@
-# Self-hosting a buzz relay
+# buzz-relay-thin
 
-Scripts to run one [buzz](https://github.com/block/buzz) relay on one server, for
-one community.
+A one-time bootstrap for a self-hosted [buzz](https://github.com/block/buzz)
+relay.
 
-The relay itself is compiled from the upstream source and runs directly on the
-machine under systemd. Its three datastores — Postgres, Redis, and MinIO — run
-as Docker containers alongside it. Nothing else from the buzz project (desktop
-app, agents, dev tooling) is installed.
-
-## Before you start
-
-You need a Linux server with:
-
-- `git`, `docker`, and `openssl` installed, and the Docker daemon running
-- the Docker Compose plugin, **version 2.24 or newer** (`docker compose version`)
-- `sudo` access
-
-The relay is compiled from source, so expect the first install to take a while.
-You don't need to install Rust yourself — upstream ships its own toolchain via
-Hermit, which the installer activates if it's there, falling back to a
-system-installed `cargo` otherwise.
-
-You also need to decide on a hostname before installing — see
-[Choosing a hostname](#choosing-a-hostname).
-
-## Install
-
-Copy this directory to the server and run the installer:
-
-```
-scp -r buzz-relay-thin/ user@server:~/
-ssh user@server 'cd buzz-relay-thin && sudo ./install.sh --host relay.lan'
+```bash
+git clone https://github.com/armstrys/buzz-relay-thin.git
+cd buzz-relay-thin
+sudo ./install.sh --host relay.lan
 ```
 
-The installer clones the upstream buzz source into `/opt/buzz-relay/src`,
-generates an `.env` file with fresh random passwords, builds the relay, starts
-the datastore containers, sets up the database, and installs a systemd service
-that starts on boot.
+The relay comes up at `ws://relay.lan:3000`.
 
-When it finishes, clients connect to `ws://relay.lan:3000`.
+## What this is (and isn't)
 
-Running the installer again is safe. It keeps your generated passwords and any
-settings you've edited on the server. Add `--update` to pull the latest upstream
-code and rebuild.
+Upstream `block/buzz` already ships everything needed to run a relay: a
+published image (`ghcr.io/block/buzz`), a production compose bundle
+(`deploy/compose/`), and a lifecycle script (`run.sh`) with `start`, `stop`,
+`logs`, `upgrade`, `backup-hint`, and member management.
 
-## Choosing a hostname
+The one gap is first-time setup. Upstream's `.env.example` needs 8 secrets
+filled in by hand and one hostname copied into 5 fields with 3 different
+shapes. Miss one and you get a silently split community or a CORS failure
+rather than a startup error.
 
-`--host` is the single most important decision here. **Every client must connect
-using exactly the hostname you pass.**
+**That gap is all this script closes.** It generates the secrets, fans the
+hostname out correctly, optionally mints an owner keypair, and hands off to
+upstream's `run.sh`. It does not wrap, replace, or shadow anything else.
 
-The relay figures out which community a request belongs to by looking at the
-`Host` header. It only knows about the one hostname you seeded at install time,
-and refuses connections for anything else. So `relay.lan`, `relay.lan.`, an IP
-address, and a different DNS name are four different things as far as the relay
-is concerned — only one of them will work.
+After install, this repo is done. Manage the relay with upstream's tooling:
 
-Practical advice:
+```bash
+cd /opt/buzz-relay/src/deploy/compose
+./run.sh logs      # follow relay logs
+./run.sh status    # container status
+./run.sh upgrade   # pull latest image and restart
+./run.sh stop      # stop, keeping volumes
+./run.sh help      # everything else, incl. add-member / list-members
+```
 
-- Use a stable DNS name, not a DHCP-assigned IP address.
-- If you later put the relay behind a TLS proxy and switch clients to `wss://`,
-  re-run `install.sh --host <new-hostname>` to register the new one.
+## Requirements
 
-## Before you expose it to the internet
+A Linux host with `git`, `openssl`, Docker, and the Compose plugin. Use `sudo`
+if installing to the default `/opt/buzz-relay`, or pass `--dir` to somewhere
+you own. TLS additionally needs Compose 2.24.4+ (checked at install time).
 
-Fresh installs come up as an **open relay** — `BUZZ_REQUIRE_AUTH_TOKEN=false` in
-`.env` means anyone who can reach the port can connect. That's convenient on a
-trusted LAN and wrong anywhere else. Set it to `true` and restart the service if
-your relay is reachable more widely.
+## Open vs closed
 
-Two other things the installer deliberately leaves to you:
+By default the relay is **open** — no auth token, no membership check. Anyone
+who can reach the port can connect. That's the right default for a trusted LAN
+and the wrong one for the public internet.
 
-- **Firewall.** Open the relay port (3000 by default). Leave the datastore ports
-  closed — they're bound to loopback and should stay that way.
-- **TLS.** Traffic is plain `ws://`. Outside a trusted network, terminate TLS in
-  a reverse proxy, serve `wss://`, and re-run the installer with `--host` set to
-  the new hostname.
+For a closed relay, give it an owner:
+
+```bash
+# You already have a Nostr identity (64-char hex pubkey, not an npub):
+sudo ./install.sh --host buzz.example.com --tls --owner <hex>
+
+# You don't, and want one generated:
+sudo ./install.sh --host buzz.example.com --tls --generate-owner
+```
+
+Either sets `RELAY_OWNER_PUBKEY` and turns on `BUZZ_REQUIRE_AUTH_TOKEN`,
+`BUZZ_REQUIRE_RELAY_MEMBERSHIP`, and `BUZZ_ALLOW_NIP_OA_AUTH`.
+
+`--generate-owner` prints the private key **once** and does not store it. Save
+it immediately, then import it into your Nostr client — that key is how you
+administer the relay.
+
+## TLS
+
+```bash
+sudo ./install.sh --host buzz.example.com --tls --generate-owner
+```
+
+This pulls in upstream's `compose.caddy.yml`. Caddy terminates HTTPS on 80/443
+with automatic Let's Encrypt certificates and proxies to the relay over the
+internal network; the relay port is not published to the host. Clients connect
+to `wss://buzz.example.com` with no port.
+
+The hostname must resolve to this machine publicly and 80/443 must be open, or
+certificate issuance fails.
 
 ## Ports
 
-Seven ports in total. Only the relay port is meant to be reachable from other
-machines; the rest bind to loopback.
+Only the relay port is published:
 
-| Flag | Default | What it is |
+| Mode | Published |
+|---|---|
+| default | 3000 (or `--port N`) |
+| `--tls` | 80, 443 (Caddy only) |
+
+Postgres, Redis, and MinIO sit on an internal Docker bridge network with no
+host bindings at all — that's how upstream's `compose.yml` is written, so
+there's nothing to configure and nothing to collide with.
+
+## Choosing `--host`
+
+This is the decision to get right. The relay identifies communities by the
+`Host` header, so `relay.lan`, an IP address, and a different DNS name are all
+different communities. Every client must use exactly the hostname you install
+with. Prefer a stable DNS name over a DHCP address.
+
+Changing it later means reinstalling.
+
+## Options
+
+| Flag | Default | What it does |
 |---|---|---|
-| `--port` | 3000 | the relay — **the only port clients use** |
-| `--health-port` | 8080 | relay health check |
-| `--metrics-port` | 9102 | relay Prometheus metrics |
-| `--pg-port` | 5432 | Postgres |
-| `--redis-port` | 6379 | Redis |
-| `--minio-port` | 9000 | MinIO (S3 API) |
-| `--minio-console-port` | 9001 | MinIO web console |
+| `--host HOST` | *(required)* | Hostname clients connect to |
+| `--port N` | 3000 | Relay port (ignored with `--tls`) |
+| `--tls` | off | Caddy reverse proxy, automatic HTTPS |
+| `--owner HEX` | — | 64-char hex Nostr pubkey; closed relay |
+| `--generate-owner` | off | Mint an owner keypair; closed relay |
+| `--image-tag TAG` | `main` | `ghcr.io/block/buzz` tag |
+| `--dir PATH` | `/opt/buzz-relay` | Install root |
 
-If something on the box already uses one of these, move it at install time:
+Pin `--image-tag` to a `sha-<7>` or semver tag for production; `main` tracks
+upstream's pre-release builds.
 
-```
-sudo ./install.sh --host relay.lan --port 3001 --health-port 8180
-```
+## Back this up
 
-Only the host-side port changes; the ports inside the containers stay fixed, so
-the services can still find each other.
+`/opt/buzz-relay/src/deploy/compose/.env` (mode 0600) holds every generated
+secret. They must stay stable across restarts — losing them means losing the
+relay identity. Run `./run.sh backup-hint` for the full checklist, which also
+covers the Postgres, MinIO, and git volumes.
 
-**These flags only set defaults on a fresh install.** After that,
-`/opt/buzz-relay/src/.env` on the server is the source of truth. To change a
-port later, either pass the flag again or edit `.env` directly and restart:
-
-```
-sudo systemctl restart buzz-relay                    # relay ports
-cd /opt/buzz-relay/src && docker compose up -d       # datastore ports
-```
-
-Either way, your changes survive the next `sudo ./install.sh --update`.
-
-## Check that it worked
-
-Confirm the relay started cleanly:
-
-```
-journalctl -u buzz-relay -n 200 | grep -E 'Config loaded|Deployment community ensured'
-```
-
-`Config loaded` should show your relay URL and ports. `Deployment community
-ensured` should show `host=<your-host>:<port>`.
-
-Then confirm the datastores aren't exposed to the network:
-
-```
-cd /opt/buzz-relay/src && docker compose config | grep -A3 ports
-```
-
-Every published port must start with `127.0.0.1:`. If any is a bare port number,
-the Compose override didn't apply — almost always because Docker Compose is
-older than 2.24, which is the first version that understands the `!override` tag
-the override file uses. Without it, Compose *adds* the loopback binding next to
-upstream's `0.0.0.0` one instead of replacing it, and **your database is open to
-the network.** Upgrade Compose and re-run the installer.
-
-## Day-to-day
-
-```
-systemctl status buzz-relay
-systemctl restart buzz-relay
-journalctl -u buzz-relay -f
-```
-
-To update to the latest upstream code, re-run the installer with `--update`, or
-do it by hand:
-
-```
-cd /opt/buzz-relay/src
-git pull && cargo build --release -p buzz-relay -p buzz-admin
-sudo systemctl restart buzz-relay
-```
-
-Your `.env` and the Compose override are untracked, so a pull leaves them alone.
+Re-running `install.sh` on an existing install is refused rather than
+regenerating secrets, because new credentials against the surviving Postgres
+volume would just fail to authenticate.
 
 ## What's in this repo
 
-| File | What it does |
+| File | |
 |---|---|
-| `install.sh` | Does everything above: clone, generate `.env`, build, start datastores, migrate, install the service. |
-| `docker-compose.override.yml` | Layered over upstream's `docker-compose.yml` to bind the datastores to loopback and read ports and passwords from `.env`. |
-| `buzz-relay.service` | The systemd unit — applies migrations, then runs the relay. |
+| `install.sh` | Clone upstream, write `.env`, call `run.sh start` |
 
-`.env` is generated on the server, not tracked here.
-
-## Notes on how it's put together
-
-Useful if you're modifying this, skippable otherwise.
-
-**Only two crates are built** — `buzz-relay` and `buzz-admin`, in release mode.
-Building the whole workspace would drag in the desktop app and agent crates that
-a relay box has no use for.
-
-**Only four containers start** — `postgres`, `redis`, `minio`, and a one-shot
-`minio-init` that creates the storage bucket. Upstream's dev-only services
-(Keycloak, Adminer, Prometheus) never come up.
-
-**The systemd unit runs the binary directly** (`Type=simple`), so the relay is
-the main process and signal handling stays clean. `ExecStartPre` re-applies
-migrations on every start using the compiled `buzz-admin migrate` rather than
-upstream's `just migrate` — `just` comes from Hermit, which wants a writable
-`$HOME/.cache` that the unit's sandboxing (`ProtectHome`, `ProtectSystem`)
-blocks. Migrations are idempotent, so a restart with nothing to do costs
-nothing.
+Compose files, the image, the Caddyfile, and `run.sh` all come from upstream.
+Upstream's own compose README notes that a bootstrap script "should eventually
+replace manual `.env` editing" — if that lands, this repo stops being needed,
+which is the intent.
