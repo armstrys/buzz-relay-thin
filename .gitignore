@@ -1,8 +1,9 @@
 # Generated env with secrets (install.sh writes this into the upstream checkout)
 .env
 *.env
-!env.template
 
 # Upstream clone (install.sh clones into /opt/buzz-relay/src by default, but
 # a local ./src can appear during development)
 src/
+
+.DS_Store

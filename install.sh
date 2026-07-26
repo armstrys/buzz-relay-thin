@@ -1,251 +1,238 @@
 #!/usr/bin/env bash
 #
-# install.sh — one-command buzz relay bootstrap.
+# install.sh — bootstrap a buzz relay.
 #
-# Pulls the upstream block/buzz deploy/compose bundle, generates all secrets,
-# writes a complete .env, and starts the stack with docker compose. No Rust
-# toolchain, no systemd, no bare-metal build, no host port collisions.
+# Upstream block/buzz ships a production compose bundle (deploy/compose/) and a
+# lifecycle script (run.sh). The only thing missing for a normal self-hoster is
+# the one-time setup: generating secrets and filling in a .env. That is all this
+# script does.
 #
-# Only one port is published to the host: the relay (default 3000). Postgres,
-# Redis, and MinIO live on an internal Docker bridge network and are invisible
-# to the host.
+#   1. Clone block/buzz
+#   2. Write deploy/compose/.env — secrets generated, hostname fanned out
+#   3. Hand off to upstream's ./run.sh start
 #
-# Usage:
-#   ./install.sh --host relay.lan
-#   ./install.sh --host relay.lan --port 3001 --tls
-#   ./install.sh --host relay.lan --update   # pull latest image + restart
-#   ./install.sh --host relay.lan --down      # stop the stack
+# After install, manage the relay with upstream's run.sh. This script is not
+# involved again:
+#
+#   cd /opt/buzz-relay/src/deploy/compose
+#   ./run.sh logs | status | upgrade | stop | backup-hint
 
 set -euo pipefail
 
 REPO_URL="https://github.com/block/buzz.git"
 INSTALL_DIR="${BUZZ_INSTALL_DIR:-/opt/buzz-relay}"
-RELAY_HOST=""
-RELAY_PORT=""
-DO_TLS=0
-DO_UPDATE=0
-DO_DOWN=0
-DO_FORCE=0
 IMAGE_TAG="${BUZZ_IMAGE_TAG:-main}"
-RUN_USER="${SUDO_USER:-$(id -un)}"
+RELAY_HOST=""
+RELAY_PORT=3000
+DO_TLS=0
+GEN_OWNER=0
+OWNER_PUBKEY=""
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 log()  { printf '\033[1;33m[relay]\033[0m %s\n' "$*"; }
-warn() { printf '\033[1;35m[relay] warn:\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m[relay] error:\033[0m %s\n' "$*" >&2; exit 1; }
 
 usage() {
-  cat <<EOF
+  cat <<'EOF'
 Usage: ./install.sh --host HOST [options]
 
 Required:
-  --host HOST        Canonical hostname clients will use (e.g. relay.lan)
+  --host HOST        Hostname clients will connect to (e.g. relay.lan)
 
 Options:
-  --port N           Relay port on the host (default 3000)
-  --tls              Include Caddy reverse proxy with automatic HTTPS
-                     (requires a public DNS name; ports 80/443 published)
-  --update           Pull latest image and restart (skips secret generation)
-  --down             Stop and remove containers (volumes preserved)
-  --force            Overwrite an existing .env (destructive — regenerates secrets)
+  --port N           Relay port on the host (default 3000, ignored with --tls)
+  --tls              Add Caddy for automatic HTTPS on 80/443
+  --owner HEX        64-char hex Nostr pubkey; makes this a closed relay
+  --generate-owner   Generate an owner keypair and make this a closed relay
   --image-tag TAG    ghcr.io/block/buzz tag (default: main)
   --dir PATH         Install root (default: /opt/buzz-relay)
-  --user NAME        Owner user (default: invoking user)
   -h, --help         Show this help
+
+Without --owner or --generate-owner the relay comes up OPEN: anyone who can
+reach the port can connect. That is fine on a trusted LAN and wrong on the
+public internet.
 EOF
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --host)        RELAY_HOST="$2"; shift 2 ;;
-    --port)        RELAY_PORT="$2"; shift 2 ;;
-    --tls)         DO_TLS=1; shift ;;
-    --update)      DO_UPDATE=1; shift ;;
-    --down)        DO_DOWN=1; shift ;;
-    --force)       DO_FORCE=1; shift ;;
-    --image-tag)   IMAGE_TAG="$2"; shift 2 ;;
-    --dir)         INSTALL_DIR="$2"; shift 2 ;;
-    --user)        RUN_USER="$2"; shift 2 ;;
-    -h|--help)     usage; exit 0 ;;
-    *)             die "Unknown option: $1" ;;
+    --host)           RELAY_HOST="$2"; shift 2 ;;
+    --port)           RELAY_PORT="$2"; shift 2 ;;
+    --tls)            DO_TLS=1; shift ;;
+    --owner)          OWNER_PUBKEY="$2"; shift 2 ;;
+    --generate-owner) GEN_OWNER=1; shift ;;
+    --image-tag)      IMAGE_TAG="$2"; shift 2 ;;
+    --dir)            INSTALL_DIR="$2"; shift 2 ;;
+    -h|--help)        usage; exit 0 ;;
+    *)                die "Unknown option: $1" ;;
   esac
 done
 
-# ---- down doesn't need --host -----------------------------------------------
-if [[ "$DO_DOWN" -eq 1 ]]; then
-  if [[ ! -d "$INSTALL_DIR/src/deploy/compose" ]]; then
-    die "No install found at $INSTALL_DIR. Nothing to stop."
-  fi
-  log "Stopping buzz relay stack"
-  sudo -u "$RUN_USER" bash -lc "cd '$INSTALL_DIR/src/deploy/compose' && docker compose --env-file .env -f compose.yml down"
-  exit 0
+[[ -n "$RELAY_HOST" ]] || { usage; die "--host is required."; }
+
+if [[ -n "$OWNER_PUBKEY" && "$GEN_OWNER" -eq 1 ]]; then
+  die "Use either --owner or --generate-owner, not both."
 fi
 
-[[ -z "$RELAY_HOST" ]] && { usage; die "--host is required." }
+if [[ -n "$OWNER_PUBKEY" ]]; then
+  case "$OWNER_PUBKEY" in
+    npub1*) die "--owner needs a 64-char hex pubkey, not an npub. Convert it first." ;;
+  esac
+  [[ "$OWNER_PUBKEY" =~ ^[0-9a-fA-F]{64}$ ]] || die "--owner must be 64 hex characters."
+  OWNER_PUBKEY="$(printf '%s' "$OWNER_PUBKEY" | tr 'A-F' 'a-f')"
+fi
 
+# ---- preflight ---------------------------------------------------------------
 for cmd in git docker openssl; do
   command -v "$cmd" >/dev/null 2>&1 || die "$cmd not found."
 done
-docker info >/dev/null 2>&1 || die "Docker daemon not reachable."
 docker compose version >/dev/null 2>&1 || die "Docker Compose plugin not found."
+docker info >/dev/null 2>&1 || die "Docker daemon not reachable."
+
+# compose.caddy.yml uses the !reset tag, which needs Compose v2.24.4+.
+if [[ "$DO_TLS" -eq 1 ]]; then
+  cv="$(docker compose version --short 2>/dev/null | tr -d 'v')"
+  if [[ -n "$cv" ]] && [[ "$(printf '%s\n2.24.4\n' "$cv" | sort -V | head -1)" != "2.24.4" ]]; then
+    die "--tls needs Docker Compose 2.24.4+ (found $cv)."
+  fi
+fi
 
 SRC="$INSTALL_DIR/src"
 COMPOSE_DIR="$SRC/deploy/compose"
 ENV_FILE="$COMPOSE_DIR/.env"
 
-# ---- clone or update upstream -----------------------------------------------
+if [[ -e "$ENV_FILE" ]]; then
+  die "$ENV_FILE already exists — this relay is already set up.
+Manage it with: cd $COMPOSE_DIR && ./run.sh status
+To start over, remove $INSTALL_DIR first (this destroys the config, not the
+Docker volumes; see 'docker volume ls' for those)."
+fi
+
+# ---- owner keypair -----------------------------------------------------------
+# Nostr pubkeys are BIP340 x-only: the x coordinate of privkey * G.
+OWNER_PRIVKEY=""
+if [[ "$GEN_OWNER" -eq 1 ]]; then
+  dump="$(openssl ecparam -name secp256k1 -genkey -noout 2>/dev/null \
+          | openssl ec -text -noout 2>/dev/null)" \
+    || die "openssl could not generate a secp256k1 key. Pass --owner instead."
+  priv="$(printf '%s\n' "$dump" | sed -n '/^priv:/,/^pub:/p' | sed '1d;$d' | tr -cd '0-9a-f')"
+  pub="$( printf '%s\n' "$dump" | sed -n '/^pub:/,/^ASN1/p'  | sed '1d;$d' | tr -cd '0-9a-f')"
+  while [[ "${#priv}" -lt 64 ]]; do priv="0$priv"; done   # openssl trims leading zero bytes
+  [[ "${#priv}" -eq 64 && "${#pub}" -eq 130 && "${pub:0:2}" == "04" ]] \
+    || die "Unexpected openssl key output; pass --owner instead."
+  OWNER_PRIVKEY="$priv"
+  OWNER_PUBKEY="${pub:2:64}"
+fi
+
+# ---- clone -------------------------------------------------------------------
 if [[ -d "$SRC/.git" ]]; then
-  log "Existing checkout at $SRC"
-  if [[ "$DO_UPDATE" -eq 1 ]]; then
-    log "Pulling latest upstream"
-    sudo -u "$RUN_USER" git -C "$SRC" pull --ff-only
-  fi
+  log "Using existing checkout at $SRC"
 else
-  log "Cloning upstream block/buzz"
-  mkdir -p "$INSTALL_DIR"
-  sudo -u "$RUN_USER" git clone --depth 1 "$REPO_URL" "$SRC"
+  log "Cloning block/buzz into $SRC"
+  mkdir -p "$INSTALL_DIR" 2>/dev/null \
+    || die "Cannot create $INSTALL_DIR. Re-run with sudo, or pick --dir."
+  git clone --depth 1 "$REPO_URL" "$SRC"
 fi
-chown -R "$RUN_USER":"$RUN_USER" "$INSTALL_DIR" 2>/dev/null || true
+[[ -f "$COMPOSE_DIR/run.sh" ]] || die "Upstream has no deploy/compose bundle at $COMPOSE_DIR."
 
-# ---- .env -------------------------------------------------------------------
-if [[ "$DO_UPDATE" -eq 1 && -f "$ENV_FILE" ]]; then
-  log "Update mode: keeping existing .env"
-  # Just pull the image and restart
-  log "Pulling image ghcr.io/block/buzz:$IMAGE_TAG"
-  sudo -u "$RUN_USER" docker pull "ghcr.io/block/buzz:$IMAGE_TAG"
-
-  log "Restarting stack"
-  COMPOSE_ARGS=(--env-file .env -f compose.yml)
-  [[ "$DO_TLS" -eq 1 ]] && COMPOSE_ARGS+=(-f compose.caddy.yml)
-  sudo -u "$RUN_USER" bash -lc "cd '$COMPOSE_DIR' && docker compose ${COMPOSE_ARGS[*]} up -d --wait --force-recreate"
-  exit 0
-fi
-
-if [[ -f "$ENV_FILE" && "$DO_FORCE" -ne 1 ]]; then
-  die ".env already exists at $ENV_FILE. Use --force to overwrite (regenerates secrets) or --update to restart with existing config."
-fi
-
-log "Generating .env with fresh secrets"
-
-RELAY_PORT="${RELAY_PORT:-3000}"
-PG_PASS="$(openssl rand -hex 24)"
-REDIS_PASS="$(openssl rand -hex 24)"
-S3_ACCESS="$(openssl rand -hex 12)"
-S3_SECRET="$(openssl rand -hex 24)"
-RELAY_KEY="$(openssl rand -hex 32)"
-HMAC_SECRET="$(openssl rand -hex 32)"
-
-# Determine scheme and URL based on TLS
+# ---- .env --------------------------------------------------------------------
 if [[ "$DO_TLS" -eq 1 ]]; then
-  SCHEME="wss"
-  HTTP_SCHEME="https"
-  BIND_PORT=3000  # internal — Caddy terminates TLS
+  WS_URL="wss://$RELAY_HOST"        # Caddy terminates TLS on 443; no port suffix
+  HTTP_URL="https://$RELAY_HOST"
 else
-  SCHEME="ws"
-  HTTP_SCHEME="http"
-  BIND_PORT="$RELAY_PORT"
+  WS_URL="ws://$RELAY_HOST:$RELAY_PORT"
+  HTTP_URL="http://$RELAY_HOST:$RELAY_PORT"
 fi
 
-cat > "$ENV_FILE" <<EOF
-# Generated by buzz-relay-thin install.sh on $(date -u +%Y-%m-%dT%H:%M:%SZ)
-# Do not edit by hand unless you know what you're doing — re-run install.sh
-# with --update to restart with these values preserved.
+if [[ -n "$OWNER_PUBKEY" ]]; then
+  RELAY_MODE="closed"; AUTH=true;  MEMBERSHIP=true;  NIP_OA=true
+else
+  RELAY_MODE="open";   AUTH=false; MEMBERSHIP=false; NIP_OA=false
+fi
 
-# ---- image ------------------------------------------------------------------
+log "Writing $ENV_FILE ($RELAY_MODE relay)"
+umask 077
+cat > "$ENV_FILE" <<EOF
+# Generated by buzz-relay-thin install.sh.
+# Back this file up: the secrets below must stay stable across restarts.
+
 BUZZ_IMAGE=ghcr.io/block/buzz:$IMAGE_TAG
 
-# ---- host & URL -------------------------------------------------------------
+# Every URL below is derived from --host $RELAY_HOST. The relay keys communities
+# off the Host header, so these must all agree and must match what clients use.
 BUZZ_DOMAIN=$RELAY_HOST
-RELAY_URL=${SCHEME}://${RELAY_HOST}:$RELAY_PORT
-BUZZ_MEDIA_BASE_URL=${HTTP_SCHEME}://${RELAY_HOST}:$RELAY_PORT/media
+RELAY_URL=$WS_URL
+BUZZ_MEDIA_BASE_URL=$HTTP_URL/media
 BUZZ_MEDIA_SERVER_DOMAIN=$RELAY_HOST
-BUZZ_CORS_ORIGINS=${HTTP_SCHEME}://${RELAY_HOST}:$RELAY_PORT
+BUZZ_CORS_ORIGINS=$HTTP_URL
 
-# ---- relay ------------------------------------------------------------------
-BUZZ_REQUIRE_AUTH_TOKEN=false
-BUZZ_REQUIRE_RELAY_MEMBERSHIP=false
-BUZZ_ALLOW_NIP_OA_AUTH=false
+BUZZ_REQUIRE_AUTH_TOKEN=$AUTH
+BUZZ_REQUIRE_RELAY_MEMBERSHIP=$MEMBERSHIP
+BUZZ_ALLOW_NIP_OA_AUTH=$NIP_OA
 BUZZ_AUTO_MIGRATE=true
 BUZZ_GIT_CONFORMANCE_PROBE=true
 RUST_LOG=buzz_relay=info,buzz_db=info,buzz_auth=info,buzz_pubsub=info,tower_http=info
+EOF
 
-# Stable secrets — back these up
-BUZZ_RELAY_PRIVATE_KEY=$RELAY_KEY
-BUZZ_GIT_HOOK_HMAC_SECRET=$HMAC_SECRET
+if [[ -n "$OWNER_PUBKEY" ]]; then
+  printf 'RELAY_OWNER_PUBKEY=%s\n' "$OWNER_PUBKEY" >> "$ENV_FILE"
+fi
 
-# ---- Postgres ---------------------------------------------------------------
+cat >> "$ENV_FILE" <<EOF
+
+BUZZ_RELAY_PRIVATE_KEY=$(openssl rand -hex 32)
+BUZZ_GIT_HOOK_HMAC_SECRET=$(openssl rand -hex 32)
 POSTGRES_DB=buzz
 POSTGRES_USER=buzz
-POSTGRES_PASSWORD=$PG_PASS
-
-# ---- Redis ------------------------------------------------------------------
-REDIS_PASSWORD=$REDIS_PASS
-
-# ---- MinIO / S3 -------------------------------------------------------------
-BUZZ_S3_ACCESS_KEY=$S3_ACCESS
-BUZZ_S3_SECRET_KEY=$S3_SECRET
+POSTGRES_PASSWORD=$(openssl rand -hex 24)
+REDIS_PASSWORD=$(openssl rand -hex 24)
+BUZZ_S3_ACCESS_KEY=$(openssl rand -hex 12)
+BUZZ_S3_SECRET_KEY=$(openssl rand -hex 24)
 BUZZ_S3_BUCKET=buzz-media
+# Upstream ships this in .env.example; no service in compose.yml consumes it yet.
+TYPESENSE_API_KEY=$(openssl rand -hex 24)
 
-# ---- host ports -------------------------------------------------------------
 BUZZ_HTTP_PORT=$RELAY_PORT
-
-# ---- Caddy (only used with --tls / compose.caddy.yml) -----------------------
 CADDY_HTTP_PORT=80
 CADDY_HTTPS_PORT=443
 EOF
-
 chmod 600 "$ENV_FILE"
-chown "$RUN_USER":"$RUN_USER" "$ENV_FILE"
 
-# ---- start ------------------------------------------------------------------
-log "Starting buzz relay stack"
-
-COMPOSE_ARGS=(--env-file .env -f compose.yml)
+# ---- hand off to upstream ----------------------------------------------------
+log "Starting the stack via upstream run.sh"
 if [[ "$DO_TLS" -eq 1 ]]; then
-  COMPOSE_ARGS+=(-f compose.caddy.yml)
-  log "TLS enabled: Caddy will terminate HTTPS on ports 80/443"
-  warn "Ensure $RELAY_HOST resolves to this machine and ports 80/443 are open."
+  log "TLS on — make sure $RELAY_HOST resolves here and 80/443 are open."
+  export BUZZ_COMPOSE_TLS=true
+fi
+"$COMPOSE_DIR/run.sh" start
+
+cat <<EOF
+
+------------------------------------------------------------------------
+Buzz relay is up ($RELAY_MODE).
+
+  Clients:  $WS_URL
+  Config:   $ENV_FILE  (0600 — back this up)
+  Manage:   cd $COMPOSE_DIR && ./run.sh help
+------------------------------------------------------------------------
+EOF
+
+if [[ -n "$OWNER_PRIVKEY" ]]; then
+  cat <<EOF
+Owner keypair — SHOWN ONCE, NOT STORED. Save the private key now.
+
+  public  (in .env): $OWNER_PUBKEY
+  private (yours):   $OWNER_PRIVKEY
+
+Import the private key into your Nostr client to administer this relay.
+
+EOF
 fi
 
-sudo -u "$RUN_USER" bash -lc "cd '$COMPOSE_DIR' && docker compose ${COMPOSE_ARGS[*]} up -d --wait"
+if [[ "$RELAY_MODE" == "open" ]]; then
+  cat <<EOF
+This relay is OPEN — no auth, no membership check. Fine on a trusted LAN.
+Before exposing it to the internet, re-install with --generate-owner (or
+--owner <hex>) to get a closed relay.
 
-# ---- summary ----------------------------------------------------------------
-echo ""
-echo "------------------------------------------------------------------------"
-echo "Buzz relay is up."
-echo ""
-echo "  Clients:  ${SCHEME}://${RELAY_HOST}:${RELAY_PORT}"
-echo "  Install:  $INSTALL_DIR/src"
-echo "  Env:      $ENV_FILE  (0600)"
-echo "  Image:    ghcr.io/block/buzz:$IMAGE_TAG"
-echo ""
-if [[ "$DO_TLS" -eq 1 ]]; then
-echo "  Caddy:    HTTPS on :443 → relay:3000"
-echo "  Ports:    80, 443 (host)"
-else
-echo "  Ports:    $RELAY_PORT (host) — the only published port"
-echo "           Postgres, Redis, MinIO are container-internal only"
+EOF
 fi
-echo ""
-echo "Verify:"
-echo "  curl -fsS http://${RELAY_HOST}:${RELAY_PORT}/_liveness"
-echo ""
-echo "Manage:"
-echo "  $INSTALL_DIR/src/deploy/compose && docker compose --env-file .env -f compose.yml logs -f"
-echo ""
-echo "Update to latest image:"
-echo "  ./install.sh --host $RELAY_HOST --update"
-echo ""
-echo "Stop:"
-echo "  ./install.sh --down"
-echo ""
-echo "Still yours to do:"
-if [[ "$DO_TLS" -eq 0 ]]; then
-echo "  - Firewall port $RELAY_PORT"
-echo "  - TLS: re-run with --tls --host <public-domain> when ready"
-else
-echo "  - Ensure DNS + firewall for ports 80/443"
-fi
-echo "  - If this relay is internet-reachable, set BUZZ_REQUIRE_AUTH_TOKEN=true"
-echo "    in $ENV_FILE and restart with --update"
-echo "------------------------------------------------------------------------"
